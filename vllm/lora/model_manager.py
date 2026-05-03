@@ -286,7 +286,13 @@ class LoRAModelManager:
             "Activating LoRA. int id: %d, slot index: %d", lora_model.id, index
         )
         self.lora_index_to_id[index] = lora_model.id
+        seen_modules: set[int] = set()
         for module_name, module in self.modules.items():
+            module_key = id(module)
+            if module_key in seen_modules:
+                continue
+            seen_modules.add(module_key)
+
             module_lora = self._get_lora_layer_weights(lora_model, module_name)
             if not module_lora:
                 module.reset_lora(index)
