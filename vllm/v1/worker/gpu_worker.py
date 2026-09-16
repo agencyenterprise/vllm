@@ -137,6 +137,7 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.v1.kv_surgery.view import EditPlan
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -1270,6 +1271,12 @@ class Worker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+
+    def apply_kv_edit(self, plans: list["EditPlan"]) -> None:
+        """KV surgery: run one edit plan per KV cache group on this rank."""
+        if not self.use_v2_model_runner:
+            raise NotImplementedError("KV surgery requires the V2 model runner")
+        self.model_runner.apply_kv_edit(plans)  # type: ignore[attr-defined]
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

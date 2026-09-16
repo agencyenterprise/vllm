@@ -470,6 +470,26 @@ class OutputProcessor:
     def has_request(self, request_id: str) -> bool:
         return request_id in self.request_states
 
+    def resolve_request_id(self, request_id: str) -> str:
+        """Map an external (caller-supplied) request id to the single internal
+        id the engine core knows it by; internal ids pass through.
+
+        Raises:
+            KeyError: the request is unknown or already finished.
+            ValueError: the external id fans out to several requests (n > 1).
+        """
+        if request_id in self.request_states:
+            return request_id
+        internal_ids = self.external_req_ids.get(request_id)
+        if not internal_ids:
+            raise KeyError(f"unknown request {request_id!r}")
+        if len(internal_ids) > 1:
+            raise ValueError(
+                f"request {request_id!r} fans out to {len(internal_ids)} "
+                "sequences; address one by its internal request id"
+            )
+        return internal_ids[0]
+
     def get_num_queued_tokens(self) -> int:
         """Total prompt tokens of requests currently in the prefill phase.
 

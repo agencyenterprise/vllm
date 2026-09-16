@@ -191,6 +191,25 @@ def drop(view: View, start: int, end: int, close_gap: bool) -> tuple[View, EditP
     return new_view, plan
 
 
+def continue_positions(positions: np.ndarray | None, num_slots: int) -> np.ndarray:
+    """Positions of ``num_slots`` slots after stock decode grew a view.
+
+    ``positions`` are the per-slot positions recorded at the last edit (None
+    for a never-edited request); slots added since continue from
+    ``next_position`` one per slot, which is exactly what the model runner
+    assigned them (slot index plus the request's position offset).
+    """
+    if positions is None:
+        return np.arange(num_slots, dtype=np.float64)
+    if num_slots < len(positions):
+        raise ValueError(
+            f"view has {len(positions)} slots but the request only has {num_slots}"
+        )
+    start = float(positions[-1]) + 1.0 if len(positions) else 0.0
+    grown = start + np.arange(num_slots - len(positions), dtype=np.float64)
+    return np.concatenate([positions, grown])
+
+
 def restrict(view: View, num_slots: int) -> View:
     """The prefix sub-view of the first ``num_slots`` slots.
 

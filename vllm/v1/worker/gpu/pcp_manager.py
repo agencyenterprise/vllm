@@ -580,6 +580,8 @@ class PCPManager:
             else None,
             input_ids=input_buffers.input_ids[:num_local_tokens_padded],
             positions=input_buffers.positions[:num_local_tokens_padded],
+            # PCP does not support KV surgery: RoPE positions are slot positions.
+            rope_positions=input_buffers.positions[:num_local_tokens_padded],
             is_padding=is_padding,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,

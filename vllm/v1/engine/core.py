@@ -804,6 +804,25 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def edit_kv(self, request_id: str, op: Any) -> dict[str, Any]:
+        """Apply a KV surgery op (see ``vllm.v1.kv_surgery.ops``) to a request.
+
+        Runs between scheduler steps: the op is planned against the
+        scheduler's view of the request, the cache mutations are executed on
+        every worker, and the scheduler state is committed last so a failed
+        worker pass leaves the request untouched. Returns a ``KVEditResult``
+        as a plain dict (it crosses the utility RPC).
+        """
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.v1.kv_surgery.engine_ops import commit_edit, plan_edit
+        from vllm.v1.kv_surgery.ops import as_edit_op
+
+        assert isinstance(self.scheduler, Scheduler)
+        planned = plan_edit(self.scheduler, request_id, as_edit_op(op))
+        if planned.has_cache_work:
+            self.model_executor.collective_rpc("apply_kv_edit", args=(planned.plans,))
+        return msgspec.to_builtins(commit_edit(self.scheduler, planned))
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

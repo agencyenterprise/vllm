@@ -8,8 +8,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -27,6 +29,8 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -182,6 +186,15 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
+        # KV surgery (vllm.v1.kv_surgery). `kv_positions` holds one RoPE
+        # position per computed KV slot as of the last edit; None means the
+        # stock contiguous layout. New tokens get position
+        # `slot_index + position_offset`, so the hot path only ever sees the
+        # offset. Both reset when the request is preempted (its cache is
+        # recomputed from scratch, consistently).
+        self.kv_positions: np.ndarray | None = None
+        self.position_offset = 0
+
         # Multi-modal related
         self.mm_features = mm_features or []
 
@@ -279,6 +292,18 @@ class Request:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
+
+    def reset_kv_surgery_layout(self) -> None:
+        """Forget an edited KV layout because the cache will be recomputed."""
+        if self.kv_positions is None and self.position_offset == 0:
+            return
+        logger.warning(
+            "%s: request with an edited KV cache is recomputed from scratch; "
+            "its edited positions are lost",
+            self.request_id,
+        )
+        self.kv_positions = None
+        self.position_offset = 0
 
     @property
     def use_structured_output(self) -> bool:

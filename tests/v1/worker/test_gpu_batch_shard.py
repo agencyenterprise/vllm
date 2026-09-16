@@ -100,6 +100,7 @@ def _make_batch(
         input_ids=torch.zeros(num_tokens, dtype=torch.int32, device=DEVICE),
         positions=torch.arange(num_tokens, dtype=torch.int64, device=DEVICE),
         is_padding=torch.zeros(num_tokens, dtype=torch.bool, device=DEVICE),
+        rope_positions=torch.arange(num_tokens, dtype=torch.int64, device=DEVICE),
         logits_indices=dev(logits_indices_np),
         cu_num_logits=dev(cu),
         cu_num_logits_np=cu,

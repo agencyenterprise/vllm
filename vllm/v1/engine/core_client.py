@@ -63,6 +63,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
 )
+from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -164,6 +165,9 @@ class EngineCoreClient(ABC):
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
+    def edit_kv(self, request_id: str, op: KVEditOp) -> KVEditResult:
+        raise NotImplementedError
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
@@ -254,6 +258,9 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def reset_encoder_cache_async(self) -> None:
+        raise NotImplementedError
+
+    async def edit_kv_async(self, request_id: str, op: KVEditOp) -> KVEditResult:
         raise NotImplementedError
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
@@ -350,6 +357,9 @@ class InprocClient(EngineCoreClient):
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
+
+    def edit_kv(self, request_id: str, op: KVEditOp) -> KVEditResult:
+        return msgspec.convert(self.engine_core.edit_kv(request_id, op), KVEditResult)
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
@@ -930,6 +940,11 @@ class SyncMPClient(MPClient):
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
+    def edit_kv(self, request_id: str, op: KVEditOp) -> KVEditResult:
+        return msgspec.convert(
+            self.call_utility("edit_kv", request_id, op), KVEditResult
+        )
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -1183,6 +1198,11 @@ class AsyncMPClient(MPClient):
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
+
+    async def edit_kv_async(self, request_id: str, op: KVEditOp) -> KVEditResult:
+        return msgspec.convert(
+            await self.call_utility_async("edit_kv", request_id, op), KVEditResult
+        )
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.call_utility_async("sleep", level, mode)

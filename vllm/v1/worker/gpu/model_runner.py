@@ -70,6 +70,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_surgery.kernels import apply_edit_plan
+from vllm.v1.kv_surgery.rope_descriptor import RopeDescriptor, derive_rope_descriptors
+from vllm.v1.kv_surgery.view import EditPlan
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -676,10 +679,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
             kv_cache_allocation_context=kv_cache_allocation_context,
         )
+        self.kv_caches_by_layer = kv_caches_dict
+        self.kv_surgery_descriptors: list[list[RopeDescriptor]] | None = None
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+
+    @torch.inference_mode()
+    def apply_kv_edit(self, plans: list[EditPlan]) -> None:
+        """KV surgery: apply one ``EditPlan`` per KV cache group to this rank's
+        caches. Runs between steps on the main stream, so it is ordered after
+        the previous forward pass and before the next one.
+
+        Request state is not touched here: the scheduler re-admits the edited
+        request and ``add_requests`` rebuilds it from the scheduler's truth.
+        """
+        if self.kv_surgery_descriptors is None:
+            by_layer = {
+                desc.layer_name: desc
+                for desc in derive_rope_descriptors(self.model, self.kv_caches_by_layer)
+            }
+            self.kv_surgery_descriptors = [
+                [by_layer[name] for name in group.layer_names]
+                for group in self.kv_cache_config.kv_cache_groups
+            ]
+        if len(plans) != len(self.kv_surgery_descriptors):
+            raise ValueError(
+                f"got {len(plans)} edit plans for "
+                f"{len(self.kv_surgery_descriptors)} KV cache groups"
+            )
+        for plan, descriptors in zip(plans, self.kv_surgery_descriptors):
+            apply_edit_plan(plan, descriptors)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1027,6 +1058,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                position_offset=new_req_data.position_offset,
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
@@ -1270,6 +1302,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_tokens.gpu,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
+            self.input_buffers.rope_positions,
+            self.req_states.position_offset.gpu,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
@@ -1348,6 +1382,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
+            rope_positions=self.input_buffers.rope_positions[:num_tokens_after_padding],
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -1700,7 +1735,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         model_inputs = {
             "input_ids": input_ids,
-            "positions": input_batch.positions,
+            "positions": input_batch.rope_positions,
             "inputs_embeds": inputs_embeds,
             "intermediate_tensors": None,
             # NOTE: Values returned by `prepare_inputs` will override the default

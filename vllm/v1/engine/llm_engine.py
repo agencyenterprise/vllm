@@ -34,6 +34,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
+from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
@@ -352,6 +353,20 @@ class LLMEngine:
         return self.engine_core.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def edit_kv(self, request_id: str, op: KVEditOp) -> KVEditResult:
+        """Edit a live request's KV cache in place between engine steps.
+
+        See ``vllm.v1.kv_surgery.ops`` for the ops. ``request_id`` is the id
+        passed to ``add_request`` (or the internal id it returned). The
+        request keeps generating from the edited cache. Output already
+        returned to the caller is not retracted; a drop that covers output
+        tokens removes them from the engine's history, so ``max_tokens`` is
+        counted against the shortened history and the caller may receive
+        more than ``max_tokens`` tokens in total.
+        """
+        request_id = self.output_processor.resolve_request_id(request_id)
+        return self.engine_core.edit_kv(request_id, op)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

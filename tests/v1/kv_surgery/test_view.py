@@ -10,7 +10,7 @@ keep it so.
 import numpy as np
 import pytest
 
-from vllm.v1.kv_surgery.view import View, drop, restrict, shift
+from vllm.v1.kv_surgery.view import View, continue_positions, drop, restrict, shift
 
 BLOCK_SIZE = 4
 
@@ -103,3 +103,14 @@ def test_bad_spans_rejected(span):
         shift(view, *span, 1.0)
     with pytest.raises(ValueError):
         drop(view, *span, close_gap=True)
+
+
+def test_continue_positions_extends_from_next_position():
+    np.testing.assert_array_equal(continue_positions(None, 4), [0.0, 1.0, 2.0, 3.0])
+    edited = np.array([0.0, 1.0, 5.5])
+    np.testing.assert_array_equal(
+        continue_positions(edited, 5), [0.0, 1.0, 5.5, 6.5, 7.5]
+    )
+    np.testing.assert_array_equal(continue_positions(np.zeros(0), 2), [0.0, 1.0])
+    with pytest.raises(ValueError):
+        continue_positions(edited, 2)

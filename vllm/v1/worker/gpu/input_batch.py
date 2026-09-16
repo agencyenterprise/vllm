@@ -26,7 +26,15 @@ class InputBuffers:
         self.device = device
 
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
+        # Slot positions: index into the request's KV slots. Drive the slot
+        # mapping and attention metadata.
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+        # RoPE positions the model sees: slot position + the request's
+        # KV-surgery position offset. Equal to `positions` for unedited
+        # requests.
+        self.rope_positions = torch.zeros(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
         self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
         self.query_start_loc = torch.zeros(
             max_num_reqs + 1, dtype=torch.int32, device=device
@@ -94,6 +102,8 @@ class InputBatch:
     positions: torch.Tensor
     # [num_tokens_after_padding]
     is_padding: torch.Tensor
+    # [num_tokens_after_padding] positions + per-request position offset.
+    rope_positions: torch.Tensor
 
     # [total_num_logits]
     logits_indices: torch.Tensor
@@ -161,6 +171,7 @@ class InputBatch:
 
         input_ids = input_buffers.input_ids[:num_tokens].zero_()
         positions = input_buffers.positions[:num_tokens].zero_()
+        rope_positions = input_buffers.rope_positions[:num_tokens].zero_()
 
         input_buffers.is_padding[:num_tokens].fill_(True)
         is_padding = input_buffers.is_padding[:num_tokens]
@@ -198,6 +209,7 @@ class InputBatch:
             input_ids=input_ids,
             positions=positions,
             is_padding=is_padding,
+            rope_positions=rope_positions,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -234,6 +246,7 @@ def set_dummy_context(
         input_batch.query_start_loc_np[:-1], input_batch.num_scheduled_tokens
     )
     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
+    input_batch.rope_positions.copy_(input_batch.positions)
 
     seq_len = context_len + query_len
     for block_table, block_size, bpk in zip(
@@ -330,10 +343,12 @@ def prepare_prefill_inputs(
 @triton.jit
 def _prepare_pos_seq_lens_kernel(
     pos_ptr,
+    rope_pos_ptr,
     seq_lens_ptr,
     idx_mapping_ptr,
     query_start_loc_ptr,
     num_computed_tokens_ptr,
+    position_offset_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -357,11 +372,18 @@ def _prepare_pos_seq_lens_kernel(
     seq_len = num_computed_tokens + query_len
     tl.store(seq_lens_ptr + req_id, seq_len)
 
+    if position_offset_ptr is not None:
+        position_offset = tl.load(position_offset_ptr + req_state_idx)
+    else:
+        position_offset = 0
+
     for i in tl.range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
         pos = num_computed_tokens + block
         tl.store(pos_ptr + start + block, pos, mask=mask)
+        if rope_pos_ptr is not None:
+            tl.store(rope_pos_ptr + start + block, pos + position_offset, mask=mask)
 
 
 def prepare_pos_seq_lens(
@@ -370,16 +392,25 @@ def prepare_pos_seq_lens(
     num_computed_tokens: torch.Tensor,
     pos: torch.Tensor,
     seq_lens: torch.Tensor,
+    rope_pos: torch.Tensor | None = None,
+    position_offset: torch.Tensor | None = None,
 ) -> None:
+    """Fill slot positions and seq_lens, and optionally the RoPE positions.
+
+    ``rope_pos[i] = pos[i] + position_offset[request of token i]``; the
+    offset is zero unless the request's KV cache was edited.
+    """
     num_reqs = idx_mapping.shape[0]
     # NOTE(woosuk): We do +1 because the last thread block is used
     # to pad unused seq_lens as 0 for full CUDA graphs.
     _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
         pos,
+        rope_pos,
         seq_lens,
         idx_mapping,
         query_start_loc,
         num_computed_tokens,
+        position_offset,
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
     )

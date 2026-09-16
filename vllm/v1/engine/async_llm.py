@@ -52,6 +52,7 @@ from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollec
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -1042,6 +1043,17 @@ class AsyncLLM(EngineClient):
 
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
+
+    async def edit_kv(self, request_id: str, op: KVEditOp) -> KVEditResult:
+        """Edit a live request's KV cache in place between engine steps.
+
+        See ``vllm.v1.kv_surgery.ops`` for the ops. ``request_id`` is the id
+        the request was submitted with (or its internal engine id). Streamed
+        output is not retracted by a drop, but dropped output tokens stop
+        counting against ``max_tokens``; see ``LLMEngine.edit_kv``.
+        """
+        request_id = self.output_processor.resolve_request_id(request_id)
+        return await self.engine_core.edit_kv_async(request_id, op)
 
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:
