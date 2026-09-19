@@ -52,7 +52,7 @@ from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollec
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
-from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult
+from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult, KVViewInfo
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -1050,10 +1050,170 @@ class AsyncLLM(EngineClient):
         See ``vllm.v1.kv_surgery.ops`` for the ops. ``request_id`` is the id
         the request was submitted with (or its internal engine id). Streamed
         output is not retracted by a drop, but dropped output tokens stop
-        counting against ``max_tokens``; see ``LLMEngine.edit_kv``.
+        counting against ``max_tokens``, and the streamed history never
+        reflects spliced-in tokens; see ``LLMEngine.edit_kv``.
         """
         request_id = self.output_processor.resolve_request_id(request_id)
-        return await self.engine_core.edit_kv_async(request_id, op)
+        return await self.engine_core.edit_kv_async(
+            request_id, self.output_processor.resolve_edit_op(op)
+        )
+
+    async def add_fork_request(
+        self,
+        src_request_id: str,
+        request_id: str,
+        prompt: PromptType,
+        params: SamplingParams,
+        num_slots: int | None = None,
+        *,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        lora_request: LoRARequest | None = None,
+        priority: int = 0,
+        resumable: bool = False,
+    ) -> RequestOutputCollector:
+        """Add a fork of a live request; see ``fork`` and
+        ``LLMEngine.fork_request``."""
+        if self.errored:
+            raise EngineDeadError()
+        if not isinstance(request_id, str):
+            raise TypeError(f"request_id must be a string, got {type(request_id)}")
+        src_request_id = self.output_processor.resolve_request_id(src_request_id)
+        if tokenization_kwargs is None:
+            tokenization_kwargs = {"add_special_tokens": False}
+        request = await self.input_processor.process_inputs_async(
+            request_id,
+            prompt,
+            params,
+            supported_tasks=await self.get_supported_tasks(),
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            priority=priority,
+            resumable=resumable,
+        )
+        prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+        self.input_processor.assign_request_id(request)
+        # Forks are requests like any other for admission control.
+        self.check_admission(request_id=request.request_id)
+
+        if self.output_processor.has_request(request.request_id):
+            # Only possible without request-id randomization; registering
+            # would be taken for a streaming update of the live request.
+            raise ValueError(f"request id {request.request_id!r} is already in use")
+
+        self._run_output_handler()
+        # Use the cloned params that process_inputs() may have updated.
+        params = request.params
+        queue = RequestOutputCollector(params.output_kind, request.request_id)
+        self.output_processor.add_request(request, prompt_text, None, 0, queue)
+        try:
+            await self.engine_core.fork_kv_async(src_request_id, request, num_slots)
+        except BaseException:
+            # Rejection, or cancellation while the RPC was in flight (the core
+            # may have admitted the fork by then): unregister here and abort
+            # there; aborting an id the core never saw is a no-op.
+            self.output_processor.abort_requests([request.request_id], internal=True)
+            await self.engine_core.abort_requests_async([request.request_id])
+            raise
+        if self.log_requests:
+            logger.info("Added fork %s of %s.", request.request_id, src_request_id)
+        return queue
+
+    async def fork(
+        self,
+        src_request_id: str,
+        request_id: str,
+        prompt: PromptType,
+        sampling_params: SamplingParams,
+        num_slots: int | None = None,
+        *,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        lora_request: LoRARequest | None = None,
+        priority: int = 0,
+        resumable: bool = False,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        """Generate from a fork of a live request's KV cache.
+
+        The fork starts as the source's first ``num_slots`` slots (all by
+        default), shared by reference, with ``prompt`` appended and prefilled
+        against that prefix only. Outputs stream like ``generate``. A
+        ``resumable`` fork stops streaming when it pauses after its first
+        stop (``finish_reason`` set, ``finished`` False); use that to prefill
+        tokens for a ``SpliceOp`` into the source.
+
+        Unlike ``generate``, a resumable fork that has paused is deliberately
+        NOT aborted when this generator ends or is closed: it keeps its KV
+        cache and the source's shared blocks pinned until the caller
+        ``abort``s it. Closing the generator before the pause arrives still
+        aborts the fork. If the fork is preempted it recomputes its prefix
+        from its own tokens, which is not the source's cache when the source
+        had been edited (a warning is logged).
+        Outputs report ``prompt_token_ids`` as the appended tokens only
+        (``prompt_logprobs`` are rejected). See ``LLMEngine.fork_request``.
+
+        A fork the engine core rejects (unknown source, bad ``num_slots``,
+        ``n > 1``, ...) raises that rejection directly before any output;
+        only failures while streaming are wrapped in ``EngineGenerateError``.
+        """
+        q: RequestOutputCollector | None = None
+        done = False
+        try:
+            # add_fork_request cleans up after itself, so a failure here
+            # leaves q unset and nothing to abort.
+            q = await self.add_fork_request(
+                src_request_id,
+                request_id,
+                prompt,
+                sampling_params,
+                num_slots,
+                tokenization_kwargs=tokenization_kwargs,
+                lora_request=lora_request,
+                priority=priority,
+                resumable=resumable,
+            )
+            while not done:
+                out = q.get_nowait() or await q.get()
+                assert isinstance(out, RequestOutput)
+                done = out.finished or (
+                    resumable and any(c.finish_reason is not None for c in out.outputs)
+                )
+                if out is not STREAM_FINISHED:
+                    yield out
+        except (asyncio.CancelledError, GeneratorExit):
+            # A finished fork is gone already; a paused one is kept on purpose.
+            if q is not None and not done:
+                await self.abort(q.request_id, internal=True)
+                if self.log_requests:
+                    logger.info("Fork %s aborted.", request_id)
+            raise
+        # Engine is dead. Do not abort since we shut down.
+        except EngineDeadError:
+            if self.log_requests:
+                logger.info("Fork %s failed (engine dead).", request_id)
+            raise
+        except (VLLMClientError, GracefulHTTPError) as e:
+            if self.log_requests:
+                logger.info("Fork %s failed (bad request): %s.", request_id, e)
+            raise
+        except Exception as e:
+            if q is None:
+                # The engine core rejected the fork: the caller's error.
+                raise
+            if not done:
+                await self.abort(q.request_id, internal=True)
+            if self.log_requests:
+                logger.info("Fork %s failed due to %r.", request_id, e)
+            raise EngineGenerateError() from e
+        finally:
+            if q is not None:
+                # Only cancels an input-stream task, which forks never have;
+                # a paused fork's collector keeps taking its final output.
+                q.close()
+
+    async def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+        """Describe a live request's KV layout (slots, blocks, and with
+        ``positions`` the per-slot position list, which is context-sized)."""
+        request_id = self.output_processor.resolve_request_id(request_id)
+        return await self.engine_core.inspect_kv_async(request_id, positions)
 
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:

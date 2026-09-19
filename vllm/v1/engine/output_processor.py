@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
+import msgspec
 import numpy as np
 import torch
 
@@ -32,6 +33,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.kv_surgery.ops import KVEditOp, SpliceOp, as_edit_op
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -469,6 +471,16 @@ class OutputProcessor:
 
     def has_request(self, request_id: str) -> bool:
         return request_id in self.request_states
+
+    def resolve_edit_op(self, op: object) -> KVEditOp:
+        """Normalize a KV edit op (instance or dict form) and map the request
+        ids it carries to internal ids."""
+        edit = as_edit_op(op)
+        if isinstance(edit, SpliceOp):
+            edit = msgspec.structs.replace(
+                edit, src_request_id=self.resolve_request_id(edit.src_request_id)
+            )
+        return edit
 
     def resolve_request_id(self, request_id: str) -> str:
         """Map an external (caller-supplied) request id to the single internal

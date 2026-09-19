@@ -814,14 +814,95 @@ class EngineCore:
         as a plain dict (it crosses the utility RPC).
         """
         from vllm.v1.core.sched.scheduler import Scheduler
-        from vllm.v1.kv_surgery.engine_ops import commit_edit, plan_edit
+        from vllm.v1.kv_surgery.engine_ops import commit_edit, plan_edit, release
         from vllm.v1.kv_surgery.ops import as_edit_op
 
         assert isinstance(self.scheduler, Scheduler)
         planned = plan_edit(self.scheduler, request_id, as_edit_op(op))
         if planned.has_cache_work:
-            self.model_executor.collective_rpc("apply_kv_edit", args=(planned.plans,))
+            try:
+                self.model_executor.collective_rpc(
+                    "apply_kv_edit", args=(planned.plans,)
+                )
+            except BaseException as e:
+                # Best effort: the pass is not atomic across workers, so a
+                # rank that already ran holds a cache the scheduler will never
+                # describe. The caller owns the request and must abort it.
+                release(self.scheduler, planned)
+                if not isinstance(e, Exception):
+                    raise
+                raise RuntimeError(
+                    f"{request_id}: KV edit failed on a worker; the request's "
+                    "cache may be partially edited and it should be aborted"
+                ) from e
         return msgspec.to_builtins(commit_edit(self.scheduler, planned))
+
+    def fork_kv(
+        self,
+        src_request_id: str,
+        request: EngineCoreRequest,
+        num_slots: int | None = None,
+    ) -> None:
+        """Add ``request`` with its KV cache starting as the first
+        ``num_slots`` computed slots of ``src_request_id`` (all by default).
+
+        The source's fully occupied blocks are shared by reference and its
+        partial last block is copied, so both requests append independently;
+        shared blocks are read-only for edits on either side. ``request``'s
+        prompt is the tokens to append; the scheduler prefills them on top of
+        the shared prefix. Use ``inspect_kv`` to look at the result.
+        """
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.v1.kv_surgery.engine_ops import (
+            commit_fork,
+            plan_fork,
+            reject_unsupported_inputs,
+            release,
+            rollback_fork,
+        )
+
+        assert isinstance(self.scheduler, Scheduler)
+        # Before preprocess_add_request, whose only side effects (grammar
+        # compilation, multimodal cache) belong to exactly these request
+        # kinds; every later plan_fork rejection then leaves nothing behind.
+        reject_unsupported_inputs(
+            request.mm_features, request.prompt_embeds, request.sampling_params
+        )
+        if request.abort_immediately:
+            # Connector-only, and the only add_request step that runs after
+            # the scheduler admits a request (rollback_fork relies on that).
+            raise NotImplementedError("a fork cannot be aborted immediately")
+        req, request_wave = self.preprocess_add_request(request)
+        planned = plan_fork(self.scheduler, src_request_id, req, num_slots)
+        if planned.has_cache_work:
+            try:
+                self.model_executor.collective_rpc(
+                    "apply_kv_edit", args=(planned.plans,)
+                )
+            except BaseException as e:
+                # A fork only writes into its own fresh block, so a failed
+                # pass leaves the source intact; the fresh block goes back.
+                release(self.scheduler, planned)
+                if not isinstance(e, Exception):
+                    raise
+                raise RuntimeError(
+                    f"fork of {src_request_id} failed on a worker; the source "
+                    "request is intact and nothing was added"
+                ) from e
+        try:
+            commit_fork(self.scheduler, planned)
+            self.add_request(req, request_wave)
+        except BaseException:
+            rollback_fork(self.scheduler, planned)
+            raise
+
+    def inspect_kv(self, request_id: str, positions: bool = False) -> dict[str, Any]:
+        """Describe a live request's KV layout (``KVViewInfo`` as a dict)."""
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.v1.kv_surgery.engine_ops import inspect_kv
+
+        assert isinstance(self.scheduler, Scheduler)
+        return msgspec.to_builtins(inspect_kv(self.scheduler, request_id, positions))
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

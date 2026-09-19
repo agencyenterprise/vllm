@@ -63,7 +63,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
 )
-from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult
+from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult, KVViewInfo
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -168,6 +168,17 @@ class EngineCoreClient(ABC):
     def edit_kv(self, request_id: str, op: KVEditOp) -> KVEditResult:
         raise NotImplementedError
 
+    def fork_kv(
+        self,
+        src_request_id: str,
+        request: EngineCoreRequest,
+        num_slots: int | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+        raise NotImplementedError
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
@@ -261,6 +272,19 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def edit_kv_async(self, request_id: str, op: KVEditOp) -> KVEditResult:
+        raise NotImplementedError
+
+    async def fork_kv_async(
+        self,
+        src_request_id: str,
+        request: EngineCoreRequest,
+        num_slots: int | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    async def inspect_kv_async(
+        self, request_id: str, positions: bool = False
+    ) -> KVViewInfo:
         raise NotImplementedError
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
@@ -360,6 +384,19 @@ class InprocClient(EngineCoreClient):
 
     def edit_kv(self, request_id: str, op: KVEditOp) -> KVEditResult:
         return msgspec.convert(self.engine_core.edit_kv(request_id, op), KVEditResult)
+
+    def fork_kv(
+        self,
+        src_request_id: str,
+        request: EngineCoreRequest,
+        num_slots: int | None = None,
+    ) -> None:
+        self.engine_core.fork_kv(src_request_id, request, num_slots)
+
+    def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+        return msgspec.convert(
+            self.engine_core.inspect_kv(request_id, positions), KVViewInfo
+        )
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
@@ -945,6 +982,21 @@ class SyncMPClient(MPClient):
             self.call_utility("edit_kv", request_id, op), KVEditResult
         )
 
+    def fork_kv(
+        self,
+        src_request_id: str,
+        request: EngineCoreRequest,
+        num_slots: int | None = None,
+    ) -> None:
+        # The sync client is single-client: the default client_index (0) is
+        # what its ADD path sends too.
+        self.call_utility("fork_kv", src_request_id, request, num_slots)
+
+    def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+        return msgspec.convert(
+            self.call_utility("inspect_kv", request_id, positions), KVViewInfo
+        )
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -1202,6 +1254,25 @@ class AsyncMPClient(MPClient):
     async def edit_kv_async(self, request_id: str, op: KVEditOp) -> KVEditResult:
         return msgspec.convert(
             await self.call_utility_async("edit_kv", request_id, op), KVEditResult
+        )
+
+    async def fork_kv_async(
+        self,
+        src_request_id: str,
+        request: EngineCoreRequest,
+        num_slots: int | None = None,
+    ) -> None:
+        # Utility calls skip the ADD path, which is where this is normally set;
+        # without it the fork's outputs would route to client 0.
+        request.client_index = self.client_index
+        await self.call_utility_async("fork_kv", src_request_id, request, num_slots)
+
+    async def inspect_kv_async(
+        self, request_id: str, positions: bool = False
+    ) -> KVViewInfo:
+        return msgspec.convert(
+            await self.call_utility_async("inspect_kv", request_id, positions),
+            KVViewInfo,
         )
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:

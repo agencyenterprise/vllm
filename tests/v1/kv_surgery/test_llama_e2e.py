@@ -18,14 +18,17 @@ import os
 # subprocess of the multiprocess test cannot be forked from it.
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
+import asyncio  # noqa: E402
+
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from vllm.engine.arg_utils import EngineArgs  # noqa: E402
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs  # noqa: E402
 from vllm.sampling_params import SamplingParams  # noqa: E402
+from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 from vllm.v1.engine.llm_engine import LLMEngine  # noqa: E402
-from vllm.v1.kv_surgery.ops import DropOp, KVEditOp, ShiftOp  # noqa: E402
+from vllm.v1.kv_surgery.ops import DropOp, KVEditOp, ShiftOp, SpliceOp  # noqa: E402
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
@@ -42,7 +45,6 @@ PROMPT = (
 
 
 def _make_engine(multiprocess: bool) -> LLMEngine:
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1" if multiprocess else "0"
     args = EngineArgs(
         model=MODEL,
         enable_prefix_caching=False,
@@ -53,7 +55,9 @@ def _make_engine(multiprocess: bool) -> LLMEngine:
         async_scheduling=False,
         seed=0,
     )
-    return LLMEngine.from_engine_args(args, enable_multiprocessing=multiprocess)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1" if multiprocess else "0")
+        return LLMEngine.from_engine_args(args, enable_multiprocessing=multiprocess)
 
 
 @pytest.fixture(scope="module")
@@ -223,6 +227,152 @@ def test_edit_over_the_multiprocess_client(prompt_ids):
             driver.edit(DropOp(0, 10_000))
         with pytest.raises(Exception, match="unknown request"):
             engine.edit_kv("never-added", ShiftOp(0, 1, 1.0))
+
+        # fork_kv carries a whole EngineCoreRequest through the RPC and the
+        # fork inherits the shifted prompt layout. Resumable, so it pauses
+        # instead of finishing and stays inspectable however far ahead the
+        # core runs.
+        engine.fork_request(
+            driver.req_id,
+            "mp-fork",
+            {"prompt_token_ids": prompt_ids[:3]},
+            SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True),
+            num_slots=prompt_len,
+            resumable=True,
+        )
+        # The core may already have prefilled the fork's three tokens.
+        info = engine.inspect_kv("mp-fork", positions=True)
+        assert prompt_len <= info.num_slots <= prompt_len + 3
+        assert info.num_prompt_tokens == prompt_len + 3
+        assert info.positions == [float(11 + p) for p in range(info.num_slots)]
+        assert info.next_position == info.num_slots + 11
+        block_size = engine.vllm_config.cache_config.block_size
+        assert info.num_shared_blocks == [prompt_len // block_size]
+        assert engine.inspect_kv(driver.req_id).num_shared_blocks == [
+            prompt_len // block_size
+        ]
+        fork_out = None
+        while fork_out is None or not fork_out.outputs[0].finish_reason:
+            for out in engine.step():
+                if out.request_id == "mp-fork":
+                    fork_out = out
+                elif out.request_id == driver.req_id:
+                    driver.generated = list(out.outputs[0].token_ids)
+                    driver.finished |= out.finished
+        assert len(fork_out.outputs[0].token_ids) == 2
+        assert not fork_out.finished
+        assert engine.inspect_kv("mp-fork").status == "WAITING_FOR_STREAMING_REQ"
+        engine.abort_request(["mp-fork"])
+        with pytest.raises(Exception, match="unknown request"):
+            engine.inspect_kv("mp-fork")
+        assert engine.inspect_kv(driver.req_id).num_shared_blocks == [0]
+        with pytest.raises(Exception, match="cannot fork"):
+            engine.fork_request(
+                driver.req_id,
+                "mp-fork-2",
+                {"prompt_token_ids": prompt_ids[:1]},
+                SamplingParams(max_tokens=1),
+                num_slots=10_000,
+            )
+        with pytest.raises(Exception, match="unknown request"):
+            driver.edit(SpliceOp(0, 0, "mp-fork", 0, 1))
         assert len(driver.finish()) == 12
     finally:
         engine.engine_core.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fork_probe_and_splice_over_async_llm(prompt_ids):
+    """The agent-facing path: AsyncLLM.fork streams a probe, keeps a resumable
+    fork paused for a restricted prefill, and SpliceOp moves its slots into
+    the running context."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+        engine = AsyncLLM.from_engine_args(
+            AsyncEngineArgs(
+                model=MODEL,
+                enable_prefix_caching=False,
+                max_model_len=1024,
+                max_num_seqs=8,
+                gpu_memory_utilization=0.3,
+                async_scheduling=False,
+                seed=0,
+            )
+        )
+    try:
+        outputs = []
+
+        async def run_context():
+            # Long-lived context; aborted explicitly at the end.
+            params = SamplingParams(temperature=0.0, max_tokens=800, ignore_eos=True)
+            async for out in engine.generate(
+                {"prompt_token_ids": prompt_ids}, params, request_id="ctx"
+            ):
+                outputs.append(out)
+
+        context = asyncio.create_task(run_context())
+        while not outputs or len(outputs[-1].outputs[0].token_ids) < 4:
+            await asyncio.sleep(0.01)
+        prompt_len = len(prompt_ids)
+
+        # Probe: next-token logprobs over the prompt slots only; frees itself.
+        probe = [
+            out
+            async for out in engine.fork(
+                "ctx",
+                "probe",
+                {"prompt_token_ids": prompt_ids[-1:]},
+                SamplingParams(temperature=0.0, max_tokens=1, logprobs=5),
+                num_slots=prompt_len - 1,
+            )
+        ]
+        assert probe[-1].finished
+        assert probe[-1].outputs[0].logprobs
+        with pytest.raises(Exception, match="unknown request"):
+            await engine.inspect_kv("probe")
+
+        # Restricted prefill: a resumable fork pauses after its first stop.
+        # Fork four slots into the second block so exactly one block is shared.
+        block_size = engine.vllm_config.cache_config.block_size
+        at = block_size + 4
+        summary = [
+            out
+            async for out in engine.fork(
+                "ctx",
+                "summary",
+                {"prompt_token_ids": prompt_ids[:7]},
+                SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+                num_slots=at,
+                resumable=True,
+            )
+        ]
+        assert not summary[-1].finished
+        assert summary[-1].outputs[0].finish_reason == "length"
+        info = await engine.inspect_kv("summary")
+        assert info.status == "WAITING_FOR_STREAMING_REQ"
+        assert info.num_slots == at + 7
+        assert info.num_shared_blocks == [1]
+
+        result = await engine.edit_kv(
+            "ctx", SpliceOp(at, at + 10, "summary", at, at + 7)
+        )
+        assert result.num_tokens == result.num_slots + 1
+        assert result.next_position == result.num_slots
+        info = await engine.inspect_kv("ctx", positions=True)  # still decoding
+        assert info.num_slots >= result.num_slots
+        assert info.positions == [float(p) for p in range(info.num_slots)]
+        assert info.num_prompt_tokens == prompt_len - 3
+        await engine.abort("summary")
+        assert (await engine.inspect_kv("ctx")).num_shared_blocks == [0]
+
+        # The context keeps generating on its edited cache.
+        generated = len(outputs[-1].outputs[0].token_ids)
+        while len(outputs[-1].outputs[0].token_ids) < generated + 8:
+            await asyncio.sleep(0.01)
+        info = await engine.inspect_kv("ctx", positions=True)
+        assert info.positions == [float(p) for p in range(info.num_slots)]
+        await engine.abort("ctx")
+        await context
+        assert outputs[-1].finished
+    finally:
+        engine.shutdown()

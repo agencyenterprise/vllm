@@ -34,7 +34,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
-from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult
+from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult, KVViewInfo
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
@@ -363,10 +363,97 @@ class LLMEngine:
         returned to the caller is not retracted; a drop that covers output
         tokens removes them from the engine's history, so ``max_tokens`` is
         counted against the shortened history and the caller may receive
-        more than ``max_tokens`` tokens in total.
+        more than ``max_tokens`` tokens in total. The reverse holds for a
+        splice landing at or past the prompt boundary: the inserted tokens
+        become output tokens, count against ``max_tokens`` and can finish
+        the request sooner. The frontend's view of the
+        request (``RequestOutput.token_ids``, the detokenizer) is not
+        updated by edits: dropped text stays in it and spliced-in tokens
+        never appear; ``inspect_kv`` and the engine's history are the truth.
         """
         request_id = self.output_processor.resolve_request_id(request_id)
-        return self.engine_core.edit_kv(request_id, op)
+        return self.engine_core.edit_kv(
+            request_id, self.output_processor.resolve_edit_op(op)
+        )
+
+    def fork_request(
+        self,
+        src_request_id: str,
+        request_id: str,
+        prompt: PromptType,
+        params: SamplingParams,
+        num_slots: int | None = None,
+        *,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        lora_request: LoRARequest | None = None,
+        priority: int = 0,
+        resumable: bool = False,
+    ) -> str:
+        """Start a request whose KV cache begins as a copy-by-reference of
+        another live request's first ``num_slots`` slots (all by default),
+        continued with ``prompt``.
+
+        ``prompt`` is appended after the shared prefix and prefilled against
+        it only; text is tokenized without special tokens unless
+        ``tokenization_kwargs`` says otherwise. Two recipes:
+
+        * probe: ``SamplingParams(max_tokens=1, logprobs=-1)`` returns the
+          next-token distribution over the view (raw logits with
+          ``logprobs_mode="raw_logits"``) and frees the fork when it finishes;
+        * restricted prefill: ``resumable=True`` and ``max_tokens=1`` keep the
+          fork alive, paused, after prefilling ``prompt``; splice its new
+          slots into the source with ``SpliceOp`` and abort the fork.
+
+        The fork's outputs report ``prompt_token_ids`` as the appended tokens
+        only, while the engine (``inspect_kv``) counts the shared prefix as
+        prompt too; ``prompt_logprobs`` are therefore not supported on forks.
+        A ``resumable`` fork is never freed on its own: it holds its KV cache
+        and the source's shared blocks until ``abort_request`` is called. If
+        a fork is preempted it recomputes its prefix from its own tokens,
+        which is not the source's cache when the source had been edited (a
+        warning is logged).
+        Invalid forks (``n > 1``, pooling params, bad ``num_slots``, ...) are
+        rejected by the engine core and raise here.
+        Returns the internal request id of the fork.
+        """
+        if not isinstance(request_id, str):
+            raise TypeError(f"request_id must be a string, got {type(request_id)}")
+        src_request_id = self.output_processor.resolve_request_id(src_request_id)
+        if tokenization_kwargs is None:
+            tokenization_kwargs = {"add_special_tokens": False}
+        request = self.input_processor.process_inputs(
+            request_id,
+            prompt,
+            params,
+            supported_tasks=self.get_supported_tasks(),
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            priority=priority,
+            resumable=resumable,
+        )
+        prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+        self.input_processor.assign_request_id(request)
+
+        if self.output_processor.has_request(request.request_id):
+            # Only possible without request-id randomization; registering
+            # would be taken for a streaming update of the live request.
+            raise ValueError(f"request id {request.request_id!r} is already in use")
+        self.output_processor.add_request(request, prompt_text, None, 0)
+        try:
+            self.engine_core.fork_kv(src_request_id, request, num_slots)
+        except BaseException:
+            # Unregister here and abort there, in case the core admitted the
+            # fork before the failure surfaced; an unknown id is a no-op.
+            self.output_processor.abort_requests([request.request_id], internal=True)
+            self.engine_core.abort_requests([request.request_id])
+            raise
+        return request.request_id
+
+    def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+        """Describe a live request's KV layout (slots, blocks, and with
+        ``positions`` the per-slot position list, which is context-sized)."""
+        request_id = self.output_processor.resolve_request_id(request_id)
+        return self.engine_core.inspect_kv(request_id, positions)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

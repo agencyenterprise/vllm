@@ -72,12 +72,13 @@ class View:
         """Physical slot ids of logical slots ``[start, end)``."""
         if end is None:
             end = self.num_slots
-        self._check_span(start, end)
+        self.check_span(start, end)
         idx = np.arange(start, end, dtype=np.int64)
         blocks = np.asarray(self.block_ids, dtype=np.int64)
         return blocks[idx // self.block_size] * self.block_size + idx % self.block_size
 
-    def _check_span(self, start: int, end: int) -> None:
+    def check_span(self, start: int, end: int) -> None:
+        """Raise ``ValueError`` unless ``[start, end)`` lies within the view."""
         if not 0 <= start <= end <= self.num_slots:
             raise ValueError(
                 f"span [{start}, {end}) is not within [0, {self.num_slots}]"
@@ -134,7 +135,7 @@ def shift(view: View, start: int, end: int, delta: float) -> tuple[View, EditPla
     Rotation only; nothing is copied. Exact for K because
     ``R(delta) R(p) k = R(p + delta) k``; V is position-free.
     """
-    view._check_span(start, end)
+    view.check_span(start, end)
     positions = view.positions.copy()
     positions[start:end] += delta
     new_view = View(view.block_size, view.block_ids, positions)
@@ -156,7 +157,7 @@ def drop(view: View, start: int, end: int, close_gap: bool) -> tuple[View, EditP
     in position space; their K keeps the values computed with the span present.
     Blocks no longer needed for the shorter view are reported freed.
     """
-    view._check_span(start, end)
+    view.check_span(start, end)
     n = view.num_slots
     removed = end - start
     kept = n - removed
@@ -173,6 +174,12 @@ def drop(view: View, start: int, end: int, close_gap: bool) -> tuple[View, EditP
     if end < n:
         gather_src = view.slot_ids(end, n)
         gather_dst = view.slot_ids(start, kept)
+        # Only an empty span yields identity rows (a non-empty span moves
+        # every survivor); drop them so a no-op plan writes nothing, since
+        # the scheduler reads gather_dst as the set of written slots. Sound
+        # because gather_slots stages every read before any write.
+        moved = gather_src != gather_dst
+        gather_src, gather_dst = gather_src[moved], gather_dst[moved]
     else:
         gather_src = gather_dst = _NO_SLOTS
     if gap != 0.0:
@@ -210,14 +217,112 @@ def continue_positions(positions: np.ndarray | None, num_slots: int) -> np.ndarr
     return np.concatenate([positions, grown])
 
 
-def restrict(view: View, num_slots: int) -> View:
-    """The prefix sub-view of the first ``num_slots`` slots.
+def splice(
+    view: View,
+    start: int,
+    end: int,
+    source: View,
+    src_start: int,
+    src_end: int,
+    close_gap: bool,
+    extra_block_ids: tuple[int, ...] = (),
+) -> tuple[View, EditPlan]:
+    """Replace logical slots ``[start, end)`` with a copy of ``source``'s
+    slots ``[src_start, src_end)``.
 
-    A temporary view for a forward pass (e.g. prefilling a summary against the
-    fixed prefix only). No blocks are freed: the full view still owns them.
+    The copied slots keep the positions they were computed at; ``source`` may
+    be another request's view or ``view`` itself. With ``close_gap`` the
+    survivors after the span are shifted so the first of them sits one
+    position after the last inserted slot (or, when nothing is inserted, at
+    the position the span started at, which is ``drop``). A view that grows
+    takes blocks from ``extra_block_ids`` in order; one that shrinks reports
+    its tail blocks freed.
     """
-    view._check_span(0, num_slots)
-    num_blocks = cdiv(num_slots, view.block_size)
-    return View(
-        view.block_size, view.block_ids[:num_blocks], view.positions[:num_slots]
+    view.check_span(start, end)
+    source.check_span(src_start, src_end)
+    n = view.num_slots
+    inserted = src_end - src_start
+    kept = n - (end - start) + inserted
+
+    tail = view.positions[end:]
+    gap = 0.0
+    if close_gap and end < n:
+        resume = (
+            float(source.positions[src_end - 1]) + 1.0
+            if inserted
+            else float(view.positions[start])
+        )
+        gap = float(view.positions[end]) - resume
+        tail = tail - gap
+    positions = np.concatenate(
+        [view.positions[:start], source.positions[src_start:src_end], tail]
     )
+
+    num_blocks = cdiv(kept, view.block_size)
+    needed = max(0, num_blocks - len(view.block_ids))
+    if len(extra_block_ids) != needed:
+        # Exact count: a surplus block would belong to nobody.
+        raise ValueError(
+            f"splice needs {needed} extra blocks, got {len(extra_block_ids)}"
+        )
+    block_ids = (view.block_ids + tuple(extra_block_ids))[:num_blocks]
+    new_view = View(view.block_size, block_ids, positions)
+
+    gather_src = np.concatenate(
+        [source.slot_ids(src_start, src_end), view.slot_ids(end, n)]
+    )
+    gather_dst = new_view.slot_ids(start, kept)
+    # Copying a slot onto itself (the source shares blocks with this view)
+    # is not a write; the scheduler reads gather_dst as the written slots.
+    # Sound because gather_slots stages every read before any write.
+    moved = gather_src != gather_dst
+    if gap != 0.0:
+        rotate_slots = new_view.slot_ids(start + inserted, kept)
+        rotate_deltas = np.full(rotate_slots.shape, -gap, dtype=np.float64)
+    else:
+        rotate_slots, rotate_deltas = _NO_SLOTS, _NO_DELTAS
+
+    plan = EditPlan(
+        gather_src=gather_src[moved],
+        gather_dst=gather_dst[moved],
+        rotate_slots=rotate_slots,
+        rotate_deltas=rotate_deltas,
+        freed_block_ids=view.block_ids[num_blocks:],
+    )
+    return new_view, plan
+
+
+def fork(
+    view: View, num_slots: int, fresh_block_ids: tuple[int, ...] = ()
+) -> tuple[View, EditPlan, int]:
+    """A new view of the first ``num_slots`` slots that shares ``view``'s
+    fully occupied blocks and owns a copy of the partially occupied one.
+
+    Sharing is by block id; the scheduler holds the reference counts. The
+    partial block (if any) is copied into ``fresh_block_ids[0]`` so both
+    views can append to it independently. Returns the new view, its plan
+    and the number of shared blocks.
+    """
+    view.check_span(0, num_slots)
+    num_shared = num_slots // view.block_size
+    shared = view.block_ids[:num_shared]
+    positions = view.positions[:num_slots]
+    needed = int(num_slots != num_shared * view.block_size)
+    if len(fresh_block_ids) != needed:
+        # Exact count: a surplus block would belong to nobody.
+        raise ValueError(
+            f"fork needs {needed} fresh block(s) for the partial last block, "
+            f"got {len(fresh_block_ids)}"
+        )
+    if not needed:
+        plan = EditPlan(_NO_SLOTS, _NO_SLOTS, _NO_SLOTS, _NO_DELTAS)
+        return View(view.block_size, shared, positions), plan, num_shared
+    new_view = View(view.block_size, shared + (fresh_block_ids[0],), positions)
+    first_partial = num_shared * view.block_size
+    plan = EditPlan(
+        gather_src=view.slot_ids(first_partial, num_slots),
+        gather_dst=new_view.slot_ids(first_partial, num_slots),
+        rotate_slots=_NO_SLOTS,
+        rotate_deltas=_NO_DELTAS,
+    )
+    return new_view, plan, num_shared
