@@ -12,23 +12,26 @@ The deliberately inconsistent edits (dropping a middle span) are only checked
 for bookkeeping here; their semantics are step 3's oracle harness.
 """
 
-import os
+import asyncio
 
-# The in-process engine initializes CUDA in this process, so the engine core
-# subprocess of the multiprocess test cannot be forked from it.
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+import numpy as np
+import pytest
+import torch
 
-import asyncio  # noqa: E402
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.envs import disable_envs_cache
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.kv_surgery.ops import (
+    DropOp,
+    KVEditOp,
+    ShiftOp,
+    SpliceOp,
+    StaleSpanError,
+)
 
-import numpy as np  # noqa: E402
-import pytest  # noqa: E402
-import torch  # noqa: E402
-
-from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs  # noqa: E402
-from vllm.sampling_params import SamplingParams  # noqa: E402
-from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
-from vllm.v1.engine.llm_engine import LLMEngine  # noqa: E402
-from vllm.v1.kv_surgery.ops import DropOp, KVEditOp, ShiftOp, SpliceOp  # noqa: E402
+from .utils import tp_sizes
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
@@ -44,9 +47,10 @@ PROMPT = (
 )
 
 
-def _make_engine(multiprocess: bool) -> LLMEngine:
+def _make_engine(multiprocess: bool, tensor_parallel_size: int = 1) -> LLMEngine:
     args = EngineArgs(
         model=MODEL,
+        tensor_parallel_size=tensor_parallel_size,
         enable_prefix_caching=False,
         max_model_len=1024,
         max_num_seqs=8,
@@ -55,16 +59,23 @@ def _make_engine(multiprocess: bool) -> LLMEngine:
         async_scheduling=False,
         seed=0,
     )
+    # An in-process engine core caches every vllm.envs value for the process
+    # at the end of its init, so it is reset before each engine (and again at
+    # the module fixture's teardown for later modules).
+    disable_envs_cache()
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1" if multiprocess else "0")
+        # Subprocesses must be spawned: this process has initialized CUDA.
+        mp.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         return LLMEngine.from_engine_args(args, enable_multiprocessing=multiprocess)
 
 
-@pytest.fixture(scope="module")
-def engine():
-    engine = _make_engine(multiprocess=False)
+@pytest.fixture(scope="module", params=tp_sizes(), ids=lambda tp: f"tp{tp}")
+def engine(request):
+    engine = _make_engine(multiprocess=False, tensor_parallel_size=request.param)
     yield engine
     engine.engine_core.shutdown()
+    disable_envs_cache()
 
 
 @pytest.fixture(scope="module")
@@ -113,6 +124,14 @@ class Driver:
 
 def _scheduler(engine: LLMEngine):
     return engine.engine_core.engine_core.scheduler  # type: ignore[attr-defined]
+
+
+def test_startup_warmup_ran_the_kernels(engine):
+    """Every worker's startup warmup derived the descriptors and ran both
+    kernels, so the first edit does not JIT-compile under the monitor."""
+    assert all(
+        engine.collective_rpc(lambda worker: worker.model_runner.kv_surgery_warm)
+    )
 
 
 def test_baseline_is_deterministic(engine, prompt_ids):
@@ -209,29 +228,36 @@ def test_drop_middle_span_bookkeeping(engine, prompt_ids):
 def test_edit_over_the_multiprocess_client(prompt_ids):
     """The op, the result and errors cross the engine-core utility RPC.
 
-    The core runs ahead of the frontend here, so only the prompt slots are
-    known to be computed; semantics are covered by the in-process tests.
+    The core runs ahead of the frontend, so the scheduler is paused (utility
+    calls still run) while the RPCs inspect and edit; semantics are covered
+    by the in-process tests.
     """
     engine = _make_engine(multiprocess=True)
     try:
-        driver = Driver(engine, "mp-edit", prompt_ids, 12)
+        driver = Driver(engine, "mp-edit", prompt_ids, 64)
         driver.run_until(3)
+        engine.engine_core.call_utility("pause_scheduler", "keep", False)
         prompt_len = len(prompt_ids)
-        result = driver.edit(ShiftOp(0, prompt_len, 11))
+        n = engine.inspect_kv(driver.req_id).num_slots
+        assert n >= prompt_len + 2
+        result = driver.edit(ShiftOp(0, prompt_len, 11, expected_num_slots=n))
         assert result.request_id == driver.core_req_id
-        assert result.num_slots >= prompt_len + 2
-        assert result.num_tokens == result.num_slots + 1
+        assert result.num_slots == n
+        assert result.num_tokens == n + 1
         # The unshifted tail keeps the next position at the slot count.
-        assert result.next_position == result.num_slots
+        assert result.next_position == n
         with pytest.raises(Exception, match="span"):
             driver.edit(DropOp(0, 10_000))
+        # The core wraps utility errors in a plain exception; the frontend
+        # restores the type so a caller can tell a stale span from a bug.
+        with pytest.raises(StaleSpanError, match=f"expected {n - 1} computed slots"):
+            driver.edit(ShiftOp(0, 1, 1.0, expected_num_slots=n - 1))
         with pytest.raises(Exception, match="unknown request"):
             engine.edit_kv("never-added", ShiftOp(0, 1, 1.0))
 
         # fork_kv carries a whole EngineCoreRequest through the RPC and the
         # fork inherits the shifted prompt layout. Resumable, so it pauses
-        # instead of finishing and stays inspectable however far ahead the
-        # core runs.
+        # instead of finishing and stays inspectable once the core resumes.
         engine.fork_request(
             driver.req_id,
             "mp-fork",
@@ -240,9 +266,8 @@ def test_edit_over_the_multiprocess_client(prompt_ids):
             num_slots=prompt_len,
             resumable=True,
         )
-        # The core may already have prefilled the fork's three tokens.
         info = engine.inspect_kv("mp-fork", positions=True)
-        assert prompt_len <= info.num_slots <= prompt_len + 3
+        assert info.num_slots == prompt_len
         assert info.num_prompt_tokens == prompt_len + 3
         assert info.positions == [float(11 + p) for p in range(info.num_slots)]
         assert info.next_position == info.num_slots + 11
@@ -251,21 +276,6 @@ def test_edit_over_the_multiprocess_client(prompt_ids):
         assert engine.inspect_kv(driver.req_id).num_shared_blocks == [
             prompt_len // block_size
         ]
-        fork_out = None
-        while fork_out is None or not fork_out.outputs[0].finish_reason:
-            for out in engine.step():
-                if out.request_id == "mp-fork":
-                    fork_out = out
-                elif out.request_id == driver.req_id:
-                    driver.generated = list(out.outputs[0].token_ids)
-                    driver.finished |= out.finished
-        assert len(fork_out.outputs[0].token_ids) == 2
-        assert not fork_out.finished
-        assert engine.inspect_kv("mp-fork").status == "WAITING_FOR_STREAMING_REQ"
-        engine.abort_request(["mp-fork"])
-        with pytest.raises(Exception, match="unknown request"):
-            engine.inspect_kv("mp-fork")
-        assert engine.inspect_kv(driver.req_id).num_shared_blocks == [0]
         with pytest.raises(Exception, match="cannot fork"):
             engine.fork_request(
                 driver.req_id,
@@ -274,9 +284,30 @@ def test_edit_over_the_multiprocess_client(prompt_ids):
                 SamplingParams(max_tokens=1),
                 num_slots=10_000,
             )
+
+        # Let the fork prefill and pause, then pause the scheduler again. The
+        # context only decodes for those few steps, far from its max_tokens.
+        engine.engine_core.call_utility("resume_scheduler")
+        fork_out = None
+        while fork_out is None or not fork_out.outputs[0].finish_reason:
+            for out in engine.step():
+                if out.request_id == "mp-fork":
+                    fork_out = out
+                elif out.request_id == driver.req_id:
+                    driver.generated = list(out.outputs[0].token_ids)
+                    driver.finished |= out.finished
+        engine.engine_core.call_utility("pause_scheduler", "keep", False)
+        assert len(fork_out.outputs[0].token_ids) == 2
+        assert not fork_out.finished
+        assert engine.inspect_kv("mp-fork").status == "WAITING_FOR_STREAMING_REQ"
+        engine.abort_request(["mp-fork"])
+        with pytest.raises(Exception, match="unknown request"):
+            engine.inspect_kv("mp-fork")
+        assert engine.inspect_kv(driver.req_id).num_shared_blocks == [0]
         with pytest.raises(Exception, match="unknown request"):
             driver.edit(SpliceOp(0, 0, "mp-fork", 0, 1))
-        assert len(driver.finish()) == 12
+        engine.engine_core.call_utility("resume_scheduler")
+        assert len(driver.finish()) == 64
     finally:
         engine.engine_core.shutdown()
 
@@ -286,8 +317,10 @@ async def test_fork_probe_and_splice_over_async_llm(prompt_ids):
     """The agent-facing path: AsyncLLM.fork streams a probe, keeps a resumable
     fork paused for a restricted prefill, and SpliceOp moves its slots into
     the running context."""
+    disable_envs_cache()
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+        mp.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         engine = AsyncLLM.from_engine_args(
             AsyncEngineArgs(
                 model=MODEL,
@@ -352,6 +385,8 @@ async def test_fork_probe_and_splice_over_async_llm(prompt_ids):
         assert info.status == "WAITING_FOR_STREAMING_REQ"
         assert info.num_slots == at + 7
         assert info.num_shared_blocks == [1]
+        with pytest.raises(StaleSpanError):
+            await engine.edit_kv("summary", ShiftOp(0, 1, 1.0, expected_num_slots=1))
 
         result = await engine.edit_kv(
             "ctx", SpliceOp(at, at + 10, "summary", at, at + 7)

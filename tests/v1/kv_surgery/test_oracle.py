@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Correctness oracle for KV surgery on Llama 3.2 1B (single GPU).
+"""Correctness oracle for KV surgery, per model and tensor-parallel size.
 
 Every *consistent* edit must reproduce a from-scratch forward pass's
 next-token logits: a tail drop is a rollback, shifting every slot is
@@ -13,19 +13,25 @@ the edited-cache forward", which is what the engine computes by construction.
 Logits come from probes: a fork with ``max_tokens=1`` and full-vocab
 ``logprobs`` in ``raw_logits`` mode commits nothing and frees itself. The
 long-lived request is a resumable streaming request, paused with its cache
-intact, which is how an agent context lives in this engine. The tolerance is
-calibrated against the noise floor between a token decoded step by step and
-the same context prefilled in one shot (bf16 GEMMs and attention kernels
-differ between those paths); the first test reports it.
+intact, which is how an agent context lives in this engine. Engines run
+with batch-invariant kernels so that copies are held to exact equality and
+only rotations get a (per-model) tolerance; see ``OracleModel``. The first test
+reports the stock noise floor between a cache decoded step by step and the
+same context prefilled in one shot.
 """
 
+import gc
 import itertools
+from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 
 from vllm.engine.arg_utils import EngineArgs
+from vllm.envs import disable_envs_cache
 from vllm.logprobs import FlatLogprobs
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -33,20 +39,103 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.kv_surgery.ops import DropOp, ShiftOp, SpliceOp
 
+from .utils import tp_sizes
+
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
     pytest.mark.skip_global_cleanup,
 ]
 
-MODEL = "meta-llama/Llama-3.2-1B"
-# Max abs logit difference allowed between an edited cache and a fresh
-# prefill. Measured on an H200: copies (drop, splice, fork) reproduce the
-# fresh logits exactly, a rotation costs one bf16 rounding of K, which moved
-# logits by at most 0.125; the noise-floor test reports the stock baseline.
-ATOL = 0.25
-# A different context must move the logits by far more than the tolerance,
-# otherwise the oracle could not tell an edit from a no-op.
-MIN_CONTRAST = 4 * ATOL
+
+@dataclass(frozen=True)
+class OracleModel:
+    """One oracle target: engine args, the max abs logit difference an
+    ulp-scale perturbation of K may cause (per TP size), and the least a
+    *different* context must move the logits by (the calibration test reports
+    the measured contrast: Llama ~10, Moonlight ~15, Gemma 4 12-22).
+
+    Copies (drop, splice, fork) move rows verbatim and must reproduce the
+    reference logits exactly. Two things perturb K by about one bf16 ulp: a
+    rotation (re-rounding K, the rope-k slice on MLA) and, at ~1000 tokens,
+    the attention kernel tiling a one-token probe differently from a full
+    prefill, which is stock behaviour. Measured on an H200: Llama moves by at
+    most 0.125 either way, Moonlight by at most 0.625. On the MoE models the
+    perturbation can flip an expert-routing decision. At TP=1 every value
+    reproduces exactly between runs (Gemma 4 at most 0.875). At TP=2 the
+    worker pair computes identical inputs identically within one run (every
+    copy check has measured exactly 0 there) but not bit-for-bit identically
+    between runs, so which flips a perturbation causes is not reproducible:
+    Gemma 4 measured between 0.25 and 2.4 across runs, hence its looser
+    ``tp_perturbation_atol``. Those TP=2 checks are coarse sanity bounds; the
+    exact copy checks, which compare within a run, carry the precision claim.
+
+    The engines run with VLLM_BATCH_INVARIANT=1. Without it the stock
+    engine's numerics depend on batch shape (tuned Triton MoE configs, cuBLAS
+    split-K, all-reduce order under TP): a cache built token by token
+    differed from a one-shot prefill by 0.16-0.6 on Moonlight with no edit at
+    all. With it every short-context stock comparison is exact on all three
+    models at TP=1 and TP=2.
+    """
+
+    engine_args: dict[str, Any]
+    perturbation_atol: float
+    min_contrast: float
+    tp_perturbation_atol: float | None = None
+    """``perturbation_atol`` at TP>1, if different."""
+    sliding_window: int | None = None
+    """What the model config must report, so the long-context test cannot
+    pass trivially on a model whose window went missing."""
+
+    def __post_init__(self):
+        # Otherwise a perturbation check could not tell an edit from a no-op.
+        assert self.min_contrast >= 2 * self.atol(tensor_parallel_size=2)
+
+    def atol(self, tensor_parallel_size: int) -> float:
+        if tensor_parallel_size > 1 and self.tp_perturbation_atol is not None:
+            return self.tp_perturbation_atol
+        return self.perturbation_atol
+
+
+MODELS = {
+    # Dense GQA, neox RoPE over the whole K row: the reference target.
+    "llama": OracleModel(
+        engine_args=dict(model="meta-llama/Llama-3.2-1B", gpu_memory_utilization=0.3),
+        perturbation_atol=0.25,
+        min_contrast=4.0,
+    ),
+    # deepseek_v3 MLA + MoE: one latent head per token, interleaved RoPE on
+    # the rope-k slice of the ``[latent | rope-k]`` row, cache replicated
+    # (not head-sharded) across TP ranks. Remote code is for the tokenizer.
+    "moonlight": OracleModel(
+        engine_args=dict(
+            model="moonshotai/Moonlight-16B-A3B-Instruct",
+            gpu_memory_utilization=0.5,
+            trust_remote_code=True,
+        ),
+        perturbation_atol=1.0,
+        min_contrast=4.0,
+    ),
+    # Hybrid GQA + MoE: five sliding-window (1024) layers per global layer,
+    # different RoPE bases and head dims per layer type, partial rotary on
+    # the global layers. The hybrid KV cache manager is disabled so window
+    # layers keep a row for every slot (see engine_ops._check_group_specs);
+    # attention is still computed over the window. Text towers only. The
+    # global layers' 512-wide heads exceed FlashAttention's limit and
+    # FlashInfer is not batch-invariant, so Triton attention is pinned.
+    "gemma4": OracleModel(
+        engine_args=dict(
+            model="google/gemma-4-26B-A4B-it",
+            gpu_memory_utilization=0.6,
+            disable_hybrid_kv_cache_manager=True,
+            language_model_only=True,
+            attention_backend="TRITON_ATTN",
+        ),
+        perturbation_atol=1.5,
+        tp_perturbation_atol=3.0,
+        min_contrast=8.0,
+        sliding_window=1024,
+    ),
+}
 
 PREFIX = (
     "You are a meticulous archivist. Rules: answer briefly, cite sources, "
@@ -59,26 +148,69 @@ TRAJECTORY_1 = (
 SUMMARY = " [Earlier: the visitor was pointed to the 1887 harbor ledger in box 14.]"
 
 
-@pytest.fixture(scope="module")
-def engine():
+def _engine_params() -> list:
+    """Every model at TP=1 and, with two GPUs, TP=2 (every rank must apply the
+    same plan to its head shard; a rank that skipped it would leave its keys
+    at the old positions and the oracle would see the disagreement). Async
+    scheduling (the core drains its batch queue before every edit) is covered
+    on Llama only."""
+    params = []
+    for tp in tp_sizes():
+        for name in MODELS:
+            params.append(pytest.param((name, tp, False), id=f"{name}-tp{tp}"))
+        params.append(pytest.param(("llama", tp, True), id=f"llama-tp{tp}-async"))
+    return params
+
+
+@dataclass
+class OracleEngine:
+    engine: LLMEngine
+    model: OracleModel
+
+
+@pytest.fixture(scope="module", params=_engine_params())
+def oracle_engine(request) -> Iterator[OracleEngine]:
+    name, tensor_parallel_size, async_scheduling = request.param
+    # An in-process engine core caches every vllm.envs value for the process
+    # at the end of its init, so the cache is reset before each engine (to
+    # read this engine's settings) and after it (so later modules read
+    # theirs). Batch-invariant mode itself is not reversible: it replaces
+    # aten matmul ops for the rest of the process, so conftest runs this
+    # module only in a session of its own.
+    disable_envs_cache()
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        mp.setenv("VLLM_BATCH_INVARIANT", "1")
+        # Subprocesses must be spawned once this process has initialized CUDA.
+        mp.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         engine = LLMEngine.from_engine_args(
             EngineArgs(
-                model=MODEL,
+                **MODELS[name].engine_args,
+                tensor_parallel_size=tensor_parallel_size,
                 enable_prefix_caching=False,
-                max_model_len=1024,
+                max_model_len=2048,
                 max_num_seqs=8,
-                gpu_memory_utilization=0.3,
-                async_scheduling=False,
+                async_scheduling=async_scheduling,
                 seed=0,
                 logprobs_mode="raw_logits",
                 max_logprobs=-1,
             ),
             enable_multiprocessing=False,
         )
-    yield engine
-    engine.engine_core.shutdown()
+        oracle = OracleEngine(engine, MODELS[name])
+        del engine
+        yield oracle
+        oracle.engine.engine_core.shutdown()
+        # pytest holds the yielded value until this teardown returns.
+        del oracle.engine
+        gc.collect()
+        torch.accelerator.empty_cache()
+        disable_envs_cache()
+
+
+@pytest.fixture(scope="module")
+def engine(oracle_engine) -> LLMEngine:
+    return oracle_engine.engine
 
 
 @pytest.fixture(scope="module")
@@ -97,8 +229,14 @@ _REQUEST_COUNTER = itertools.count(1)
 class Harness:
     """Drives one in-process engine step by step."""
 
-    def __init__(self, engine: LLMEngine):
+    def __init__(self, oracle: OracleEngine):
+        engine = oracle.engine
         self.engine = engine
+        self.model = oracle.model
+        self.perturbation_atol = oracle.model.atol(
+            engine.vllm_config.parallel_config.tensor_parallel_size
+        )
+        self.min_contrast = oracle.model.min_contrast
         self.vocab_size = engine.model_config.get_vocab_size()
         self.block_size = engine.vllm_config.cache_config.block_size
         self.outputs: dict[str, RequestOutput] = {}
@@ -222,8 +360,8 @@ class Harness:
 
 
 @pytest.fixture
-def h(engine):
-    harness = Harness(engine)
+def h(oracle_engine):
+    harness = Harness(oracle_engine)
     yield harness
     harness.close()
 
@@ -234,7 +372,7 @@ def _max_diff(label: str, a: np.ndarray, b: np.ndarray) -> float:
     return diff
 
 
-def test_probe_matches_fresh_prefill_within_noise(h, ids):
+def test_probe_matches_fresh_prefill_exactly(h, ids):
     """Calibration: the unedited decoded cache vs a one-shot prefill."""
     req = h.paused_context(ids["prefix"] + ids["t1"], num_generated=8)
     ctx = h.tokens(req)
@@ -243,7 +381,7 @@ def test_probe_matches_fresh_prefill_within_noise(h, ids):
 
     probed = h.probe(req, ctx[-1:])
     fresh = h.fresh_logits(ctx)
-    assert _max_diff("noise floor", probed, fresh) < ATOL
+    assert _max_diff("noise floor", probed, fresh) == 0
     # Probing committed nothing and released its shared blocks.
     assert h.tokens(req) == ctx
     info = h.engine.inspect_kv(req)
@@ -251,7 +389,7 @@ def test_probe_matches_fresh_prefill_within_noise(h, ids):
     assert info.num_shared_blocks == [0]
 
     other = h.fresh_logits(ids["prefix"] + ids["summary"] + ctx[-1:])
-    assert _max_diff("contrast", fresh, other) > MIN_CONTRAST
+    assert _max_diff("contrast", fresh, other) > h.min_contrast
 
 
 def test_tail_drop_is_a_rollback(h, ids):
@@ -265,7 +403,42 @@ def test_tail_drop_is_a_rollback(h, ids):
 
     probed = h.probe(req, kept[-1:])
     fresh = h.fresh_logits(kept)
-    assert _max_diff("tail drop", probed, fresh) < ATOL
+    assert _max_diff("tail drop", probed, fresh) == 0
+
+
+def test_edit_while_decoding(h, ids):
+    """A tail drop on a RUNNING request. Under async scheduling a batch is in
+    flight at the edit: the core drains it first, so its token is in the
+    engine's history (ahead of the caller's outputs) before the span is
+    checked, and it is still delivered by the next step."""
+    prompt = ids["prefix"] + ids["t1"]
+    req = h.add(prompt, max_tokens=16)
+    while req not in h.outputs or len(h.outputs[req].outputs[0].token_ids) < 4:
+        h.step()
+    seen = list(h.outputs[req].outputs[0].token_ids)
+    async_scheduling = h.engine.vllm_config.scheduler_config.async_scheduling
+
+    info = h.engine.inspect_kv(req)
+    assert info.status == "RUNNING"
+    history = h.tokens(req)
+    n = info.num_slots
+    assert n == len(history) - 1
+    assert history[: len(prompt) + len(seen)] == prompt + seen
+    # Steady-state async decoding keeps one batch in flight; the drain
+    # finished it, so the engine is one token ahead of the caller.
+    assert len(history) - len(prompt) - len(seen) == int(async_scheduling)
+
+    h.engine.edit_kv(req, DropOp(n - 3, n, expected_num_slots=n))
+    kept = history[: n - 3] + history[n:]
+    assert h.tokens(req) == kept
+
+    delivered = list(h.until_stop(req).outputs[0].token_ids)
+    num_before = len(history) - len(prompt)
+    assert delivered[:num_before] == history[len(prompt) :]
+    continuation = delivered[num_before:]
+    # Greedy decoding on the edited cache is greedy decoding of kept.
+    fresh = h.until_stop(h.add(kept, max_tokens=len(continuation)))
+    assert list(fresh.outputs[0].token_ids) == continuation
 
 
 def test_shift_of_every_slot_is_invisible(h, ids):
@@ -279,7 +452,7 @@ def test_shift_of_every_slot_is_invisible(h, ids):
 
     probed = h.probe(req, ctx[-1:])
     fresh = h.fresh_logits(ctx)
-    assert _max_diff("shift all by 37", probed, fresh) < ATOL
+    assert _max_diff("shift all by 37", probed, fresh) < h.perturbation_atol
 
 
 def test_shift_roundtrip_returns_to_the_same_cache(h, ids):
@@ -294,7 +467,7 @@ def test_shift_roundtrip_returns_to_the_same_cache(h, ids):
     ]
     after = h.probe(req, ctx[-1:])
     # Two bf16 re-rotations of K, nothing else changed.
-    assert _max_diff("shift roundtrip", after, before) < ATOL
+    assert _max_diff("shift roundtrip", after, before) < h.perturbation_atol
 
 
 def test_restricted_prefill_and_splice_match_fresh(h, ids):
@@ -317,7 +490,7 @@ def test_restricted_prefill_and_splice_match_fresh(h, ids):
     fork_out = h.until_stop(fork)
     assert not fork_out.finished
     fresh_summary = h.fresh_logits(prefix + summary)
-    assert _max_diff("restricted prefill", h.logits(fork_out), fresh_summary) < ATOL
+    assert _max_diff("restricted prefill", h.logits(fork_out), fresh_summary) == 0
     info = h.engine.inspect_kv(fork)
     assert info.num_slots == s + len(summary)
     assert info.status == "WAITING_FOR_STREAMING_REQ"
@@ -335,9 +508,9 @@ def test_restricted_prefill_and_splice_match_fresh(h, ids):
 
     probed = h.probe(req, spliced[-1:])
     fresh = h.fresh_logits(spliced)
-    assert _max_diff("splice", probed, fresh) < ATOL
+    assert _max_diff("splice", probed, fresh) == 0
     # The oracle can tell: the old context gives different logits.
-    assert _max_diff("contrast", fresh, h.fresh_logits(ctx)) > MIN_CONTRAST
+    assert _max_diff("contrast", fresh, h.fresh_logits(ctx)) > h.min_contrast
 
 
 def test_summary_flow_keeps_t2_and_resumes(h, ids):
@@ -366,7 +539,7 @@ def test_summary_flow_keeps_t2_and_resumes(h, ids):
     # This probe is a fork of a fork, the suite's only coverage of a block
     # going from two references to three; keep it.
     fork_again = h.probe(fork, summary[-1:], s + len(summary) - 1)
-    assert _max_diff("fork intact", fork_again, fork_logits) < ATOL
+    assert _max_diff("fork intact", fork_again, fork_logits) == 0
     h.engine.abort_request([fork])
 
     edited = h.probe(req, ctx[n:])
@@ -383,6 +556,41 @@ def test_summary_flow_keeps_t2_and_resumes(h, ids):
     info = h.engine.inspect_kv(req, positions=True)
     assert info.num_slots >= result.num_slots + 5 + 3
     assert info.positions == [float(p) for p in range(info.num_slots)]
+
+
+def test_edits_on_a_context_longer_than_a_window(h, ids):
+    """Sliding-window layers attend to the last window of *slots*, so on a
+    context longer than the window (1024 on Gemma 4) a tail drop is still a
+    rollback and shifting every slot is still invisible. Global-attention
+    models just run the same oracle at a longer length.
+
+    The rollback reference is a probe of the same slots taken before the
+    drop; against the fresh prefill it only bounds the stock prefill-tiling
+    perturbation (see ``OracleModel``).
+    """
+    unit = ids["prefix"] + ids["t1"]
+    req = h.paused_context(unit * (1700 // len(unit) + 1), num_generated=4)
+    ctx = h.tokens(req)
+    n = len(ctx) - 1
+    m = n - 300
+    window = h.engine.model_config.get_sliding_window()
+    assert window == h.model.sliding_window
+    # Every probe below, before and after the edits, sees more than a window.
+    assert m > (window or 0)
+    kept = ctx[:m] + ctx[n:]
+    before = h.probe(req, kept[-1:], num_slots=m)
+    assert (
+        _max_diff("long stock floor", before, h.fresh_logits(kept))
+        < h.perturbation_atol
+    )
+
+    h.engine.edit_kv(req, DropOp(m, n))
+    assert h.tokens(req) == kept
+    assert _max_diff("long tail drop", h.probe(req, kept[-1:]), before) == 0
+
+    h.engine.edit_kv(req, ShiftOp(0, m, 200))
+    after = h.probe(req, kept[-1:])
+    assert _max_diff("long shift", after, before) < h.perturbation_atol
 
 
 def test_forks_diverge_independently(h, ids):
@@ -410,12 +618,9 @@ def test_forks_diverge_independently(h, ids):
     kept = fork_ctx[: m - 3] + fork_ctx[m:]
     assert (
         _max_diff("fork after drop", h.probe(fork, kept[-1:]), h.fresh_logits(kept))
-        < ATOL
+        == 0
     )
-    # Same cache, but the two probes ran in different batches and bf16
-    # reductions are not batch-invariant, so only the calibrated tolerance
-    # is owed here (measured: identical).
-    assert _max_diff("source untouched", h.probe(req, ctx[-1:]), base) < ATOL
+    assert _max_diff("source untouched", h.probe(req, ctx[-1:]), base) == 0
     assert h.tokens(req) == ctx
     h.engine.abort_request([fork])
     assert h.engine.inspect_kv(req).num_shared_blocks == [0]

@@ -71,6 +71,7 @@ from vllm.v1.engine import (
     ReconfigureRankType,
     UtilityOutput,
     UtilityResult,
+    utility_failure_prefix,
 )
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
@@ -214,6 +215,10 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        # Outputs of batches that KV surgery drained from the batch queue,
+        # returned by the next step call(s).
+        self._drained_outputs: deque[dict[int, EngineCoreOutputs]] = deque()
+        self._drain_error: Exception | None = None
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -652,8 +657,23 @@ class EngineCore:
         3. Update the scheduler from the output.
         """
 
+        if self._drain_error is not None:
+            raise self._drain_error
         batch_queue = self.batch_queue
         assert batch_queue is not None
+        drained = None
+        if self._drained_outputs:
+            drained = self._drained_outputs.popleft()
+            if batch_queue or not self.scheduler.has_requests():
+                # As when a step only finishes a queued batch, the flag says
+                # whether this step submitted one, not whether the returned
+                # output's batch ran.
+                return drained, False
+            # The drain emptied the pipeline: submit the next batch before
+            # handing back a held output. Only into an empty queue: the
+            # normal path below needs a free slot on entry and may have to
+            # finish the oldest batch, which a step returning a held output
+            # cannot do.
 
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
@@ -664,6 +684,11 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            # Nothing is in flight after a drain, so no structured-output
+            # tokens can be pending and sampling is never deferred here.
+            assert (
+                drained is None or not scheduler_output.pending_structured_output_tokens
+            )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -692,6 +717,8 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                if drained is not None:
+                    return drained, model_executed
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -706,25 +733,7 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
-        with (
-            self.capture_iteration_details(scheduler_output) as iteration_details,
-            self.log_error_detail(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                # None from sample_tokens() implies that the original execute_model()
-                # call failed - raise that exception.
-                exec_model_fut.result()
-                raise RuntimeError("unexpected error")
-
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
-        self._attach_iteration_details(engine_core_outputs, iteration_details)
+        engine_core_outputs = self._finish_oldest_batch()
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -750,6 +759,48 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+
+    def _finish_oldest_batch(self) -> dict[int, EngineCoreOutputs]:
+        """Block on the oldest queued batch and update the scheduler from it."""
+        assert self.batch_queue
+        future, scheduler_output, exec_model_fut = self.batch_queue.pop()
+        with (
+            self.capture_iteration_details(scheduler_output) as iteration_details,
+            self.log_error_detail(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                # None from sample_tokens() implies that the original execute_model()
+                # call failed - raise that exception.
+                exec_model_fut.result()
+                raise RuntimeError("unexpected error")
+
+        # Before processing the model output, process any aborts that happened
+        # during the model execution.
+        self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
+        self._attach_iteration_details(engine_core_outputs, iteration_details)
+        return engine_core_outputs
+
+    def _drain_batch_queue(self) -> None:
+        """Finish every in-flight batch so KV surgery sees no scheduled but
+        unsampled tokens (async scheduling). The outputs are held and
+        returned by the next step call(s).
+
+        A failed batch is fatal, as it is when a step finishes it: the
+        utility call that drained reports the error, and the next step
+        re-raises it into the engine's normal failure path.
+        """
+        if self._drain_error is not None:
+            raise self._drain_error
+        try:
+            while self.batch_queue:
+                self._drained_outputs.append(self._finish_oldest_batch())
+        except Exception as e:
+            self._drain_error = e
+            raise
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
@@ -818,6 +869,7 @@ class EngineCore:
         from vllm.v1.kv_surgery.ops import as_edit_op
 
         assert isinstance(self.scheduler, Scheduler)
+        self._drain_batch_queue()
         planned = plan_edit(self.scheduler, request_id, as_edit_op(op))
         if planned.has_cache_work:
             try:
@@ -872,6 +924,9 @@ class EngineCore:
             # Connector-only, and the only add_request step that runs after
             # the scheduler admits a request (rollback_fork relies on that).
             raise NotImplementedError("a fork cannot be aborted immediately")
+        # Drain first, so that a failed drain (fatal at the next step) leaves
+        # no preprocessed request behind.
+        self._drain_batch_queue()
         req, request_wave = self.preprocess_add_request(request)
         planned = plan_fork(self.scheduler, src_request_id, req, num_slots)
         if planned.has_cache_work:
@@ -897,11 +952,20 @@ class EngineCore:
             raise
 
     def inspect_kv(self, request_id: str, positions: bool = False) -> dict[str, Any]:
-        """Describe a live request's KV layout (``KVViewInfo`` as a dict)."""
+        """Describe a live request's KV layout (``KVViewInfo`` as a dict).
+
+        Under async scheduling, if a queued batch schedules this request, this
+        first drains the batch queue so the snapshot has no in-flight tokens.
+        """
         from vllm.v1.core.sched.scheduler import Scheduler
         from vllm.v1.kv_surgery.engine_ops import inspect_kv
 
         assert isinstance(self.scheduler, Scheduler)
+        if self.batch_queue and any(
+            request_id in scheduler_output.num_scheduled_tokens
+            for _, scheduler_output, _ in self.batch_queue
+        ):
+            self._drain_batch_queue()
         return msgspec.to_builtins(inspect_kv(self.scheduler, request_id, positions))
 
     def reset_encoder_cache(self) -> None:
@@ -1501,6 +1565,8 @@ class EngineCoreProc(EngineCore):
             self.engines_running
             or self.scheduler.has_requests()
             or bool(self.batch_queue)
+            or bool(self._drained_outputs)
+            or self._drain_error is not None
         )
 
     def is_running(self) -> bool:
@@ -1715,7 +1781,7 @@ class EngineCoreProc(EngineCore):
             output.result = UtilityResult(result)
         except Exception as e:
             logger.exception("Invocation of %s method failed", name)
-            output.failure_message = f"Call to {name} method failed: {str(e)}"
+            output.failure_message = utility_failure_prefix(name) + str(e)
         enqueue_output(output)
 
     @staticmethod

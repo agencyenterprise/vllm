@@ -170,3 +170,46 @@ prefix by Δ equals recomputed K at position p+Δ.
    RoPE descriptor derivation from vLLM modules; per-group ops; then
    throughput work — confirm decode tok/s on an edited cache matches stock
    vLLM within noise, which is the whole point of the design.
+
+## Deferred (noted 2026-09-28, after step 4's hybrid work)
+
+**Hybrid models run with the hybrid KV cache manager disabled in v0.** Window
+layers then keep a row for every slot; attention is still computed over the
+window. Reason: with eviction on, evicted slots are the shared all-zero null
+block, and (a) a drop inside the last window would pull the window back over
+zero rows, (b) a fork at an evicted prefix would prefill against zeros on the
+window layers. Cost: KV memory on window layers grows with context instead of
+being capped at one window. On Gemma 4 26B (25 window : 5 global layers,
+8 vs 2 KV heads) that is ~220 KB/token instead of ~20 KB/token, i.e. ~10x
+fewer concurrent requests at the 256k native limit. Dense and MLA models are
+unaffected. This is a v0 simplification, not a lock-in.
+
+**Eviction-aware mode (the fix) when long hybrid contexts matter:**
+
+- Per-group plans skip rows whose source *and* destination are null, read
+  freely from null rows (they are zeros), and never write into a null block:
+  a real row landing in a null block gets a freshly allocated zeroed block
+  (at most one partial block per edit for a drop outside the window).
+- The realistic compaction drops a span *between* the pinned system prompt
+  and the live tail. On window layers that span is already evicted whenever
+  it lies more than one window behind the tail, so the op is block-table
+  only for that group. The remaining hazard is a drop that reaches into the
+  last window: it exposes up to k zero rows (bounded attention dilution,
+  k/window, healing as the window moves). Reject or document; do not hide.
+- Forks share blocks only when the source group has no null block under the
+  shared prefix; otherwise re-prefill prefix + new tokens as a fresh request
+  and splice (cost O(prefix), exact on both groups).
+- Extend the oracle's long-context test to eviction on.
+
+**Block-aligned drop fast path (independent of hybrids):** a drop whose
+surviving rows move by a whole number of blocks is a block-table relabel; no
+rows need to be copied, only the rotation remains O(N). Today every
+close-gap drop gathers all surviving rows. Physical order == logical order
+is preserved, so this stays within the "boring surgery" rule. Matters once
+contexts approach the native limit (a 1M-token gather on global layers moves
+~20 GB per edit).
+
+**Batched edits (independent of hybrids):** an `edit_kv` call costs ~2 ms of
+RPC and bookkeeping regardless of size (see `benchmarks/kv_surgery/README.md`).
+Editing many requests at once would be one worker pass if the plans were
+batched into a single RPC. Only matters if edits become frequent.

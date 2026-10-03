@@ -156,7 +156,10 @@ def _find_rotary_emb(model: nn.Module, layer_name: str) -> RotaryEmbedding:
             raise ValueError(
                 f"{layer_name}: ambiguous rotary embeddings on {name}: {sorted(ropes)}"
             )
-    raise ValueError(f"{layer_name}: no RotaryEmbedding found above this layer")
+    raise NotImplementedError(
+        f"{layer_name}: no RotaryEmbedding found above this layer; KV surgery "
+        "only supports RoPE models"
+    )
 
 
 def derive_rope_descriptors(
@@ -171,8 +174,8 @@ def derive_rope_descriptors(
 
     Raises:
         NotImplementedError: for a cache layer that is not dense or MLA
-            attention, for cross-layer KV sharing, or for an unsupported
-            KV cache dtype.
+            attention, for a layer without RoPE, for cross-layer KV
+            sharing, or for an unsupported KV cache dtype.
     """
     attn_layers = {
         module.layer_name: module

@@ -52,7 +52,12 @@ from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollec
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
-from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult, KVViewInfo
+from vllm.v1.kv_surgery.ops import (
+    KVEditOp,
+    KVEditResult,
+    KVViewInfo,
+    stale_span_errors_restored,
+)
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -1051,12 +1056,14 @@ class AsyncLLM(EngineClient):
         the request was submitted with (or its internal engine id). Streamed
         output is not retracted by a drop, but dropped output tokens stop
         counting against ``max_tokens``, and the streamed history never
-        reflects spliced-in tokens; see ``LLMEngine.edit_kv``.
+        reflects spliced-in tokens; see ``LLMEngine.edit_kv``. Compute spans
+        from ``inspect_kv``: the engine core runs ahead of streamed output.
         """
         request_id = self.output_processor.resolve_request_id(request_id)
-        return await self.engine_core.edit_kv_async(
-            request_id, self.output_processor.resolve_edit_op(op)
-        )
+        with stale_span_errors_restored():
+            return await self.engine_core.edit_kv_async(
+                request_id, self.output_processor.resolve_edit_op(op)
+            )
 
     async def add_fork_request(
         self,

@@ -90,5 +90,5 @@ def test_find_rotary_emb_prefers_the_sibling_named_rotary_emb():
     model.layers[0].mlp.attn = nn.Module()
 
     assert _find_rotary_emb(model, "layers.0.self_attn.mla_attn.mla_attn") is rope
-    with pytest.raises(ValueError, match="no RotaryEmbedding"):
+    with pytest.raises(NotImplementedError, match="no RotaryEmbedding"):
         _find_rotary_emb(model, "layers.0.mlp.attn")

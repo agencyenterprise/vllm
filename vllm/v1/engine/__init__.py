@@ -250,6 +250,11 @@ class UtilityOutput(
     result: UtilityResult | None = None
 
 
+def utility_failure_prefix(method_name: str) -> str:
+    """How ``UtilityOutput.failure_message`` starts for a failed call."""
+    return f"Call to {method_name} method failed: "
+
+
 class EngineCoreOutputs(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]

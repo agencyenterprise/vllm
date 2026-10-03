@@ -20,20 +20,30 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from vllm.config import VllmConfig
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.kv_surgery.ops import (
+    STALE_SPAN_PREFIX,
     DropOp,
     KVEditOp,
     KVEditResult,
     KVViewInfo,
     ShiftOp,
     SpliceOp,
+    StaleSpanError,
 )
 from vllm.v1.kv_surgery.view import (
     EditPlan,
@@ -100,14 +110,13 @@ def _needs_worker_pass(plans: list[EditPlan]) -> bool:
     return any(plan.gather_src.size or plan.rotate_slots.size for plan in plans)
 
 
-def _check_supported(scheduler: Scheduler, request: Request) -> None:
-    config = scheduler.vllm_config
-    if not scheduler.use_v2_model_runner:
-        raise NotImplementedError("KV surgery requires the V2 model runner")
+def check_config_supported(config: VllmConfig) -> None:
+    """Engine-level requirements, shared with the workers' startup warmup
+    (which runs on the V2 runner only). Runs on every edit, so it must stay
+    cheap: ``VllmConfig.use_v2_model_runner`` is re-derived on each access
+    (measured ~32 ms) and is checked by the caller instead."""
     if config.cache_config.enable_prefix_caching:
         raise NotImplementedError("KV surgery requires prefix caching to be off")
-    if config.scheduler_config.async_scheduling:
-        raise NotImplementedError("KV surgery does not support async scheduling")
     parallel = config.parallel_config
     if parallel.pipeline_parallel_size > 1:
         raise NotImplementedError("KV surgery does not support pipeline parallelism")
@@ -122,14 +131,23 @@ def _check_supported(scheduler: Scheduler, request: Request) -> None:
         raise NotImplementedError("KV surgery does not support context parallelism")
     if config.speculative_config is not None:
         raise NotImplementedError("KV surgery does not support speculative decoding")
-    if scheduler.connector is not None:
+    if config.kv_transfer_config is not None:
         raise NotImplementedError("KV surgery does not support KV connectors")
+
+
+def _check_supported(scheduler: Scheduler, request: Request) -> None:
+    if not scheduler.use_v2_model_runner:
+        raise NotImplementedError("KV surgery requires the V2 model runner")
+    check_config_supported(scheduler.vllm_config)
+    _check_group_specs(scheduler)
     reject_unsupported_inputs(
         request.mm_features, request.prompt_embeds, request.sampling_params
     )
     if request.pooling_params is not None:
         raise NotImplementedError("KV surgery does not support pooling requests")
     if request.spec_token_ids or request.num_in_flight_tokens:
+        # Under async scheduling the core drains its batch queue first, so
+        # this only fires if something bypassed EngineCore.
         raise RuntimeError(f"{request.request_id}: request has in-flight tokens")
 
 
@@ -161,6 +179,59 @@ def _editable_request(scheduler: Scheduler, request_id: str) -> Request:
         )
     _check_supported(scheduler, request)
     return request
+
+
+def _layer_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return list(spec.kv_cache_specs.values())
+    return [spec]
+
+
+def _check_group_specs(scheduler: Scheduler) -> None:
+    """Every layer must keep a KV row for every slot of the view.
+
+    Sliding-window (and chunked-local, R-SWA, Mamba) allocation evicts or
+    lacks rows, so a view over such a group would have slots that cannot be
+    copied or rotated, and the window would reach evicted (null, all-zero)
+    rows after a drop. Sliding-window models are supported with the hybrid
+    KV cache manager disabled: window layers are then allocated like full
+    attention and still computed as sliding window. Chunked-local layers
+    (Llama 4) would be allocated the same way but their chunk boundaries
+    under a drop or shift are untested, so they are refused. Only the two
+    exact spec types the oracle covers pass; subclasses (sinks, hidden-state
+    caches, R-SWA) are refused until someone looks at them.
+    """
+    for group in scheduler.kv_cache_config.kv_cache_groups:
+        for spec in _layer_specs(group.kv_cache_spec):
+            # The isinstance is for mypy; the exact type check decides.
+            if not isinstance(spec, FullAttentionSpec) or type(spec) not in (
+                FullAttentionSpec,
+                MLAAttentionSpec,
+            ):
+                advice = (
+                    "; set disable_hybrid_kv_cache_manager=True so these layers "
+                    "are allocated like full attention"
+                    if isinstance(spec, SlidingWindowSpec)
+                    else ""
+                )
+                raise NotImplementedError(
+                    f"KV surgery requires full-attention KV allocation for every "
+                    f"layer, got {type(spec).__name__} for {group.layer_names[0]}"
+                    f"{advice}"
+                )
+            if spec.attention_chunk_size is not None:
+                raise NotImplementedError(
+                    f"KV surgery does not support chunked local attention "
+                    f"({group.layer_names[0]}): untested"
+                )
+            if spec.tokens_per_state != 1:
+                # DeepSeek V4 compressed layers: one state per token group, so
+                # a slot is not a token and per-token ops do not apply.
+                raise NotImplementedError(
+                    f"KV surgery requires one KV state per token, got "
+                    f"{spec.tokens_per_state} tokens per state for "
+                    f"{group.layer_names[0]}"
+                )
 
 
 def _managers(scheduler: Scheduler) -> Managers:
@@ -290,6 +361,15 @@ def _free(scheduler: Scheduler, blocks: list[list[KVCacheBlock]]) -> None:
             group_blocks.clear()
 
 
+def _check_expected_num_slots(request: Request, expected: int | None) -> None:
+    num_slots = request.num_computed_tokens
+    if expected is not None and expected != num_slots:
+        raise StaleSpanError(
+            f"{STALE_SPAN_PREFIX}{request.request_id}: expected {expected} "
+            f"computed slots, request has {num_slots}"
+        )
+
+
 def plan_edit(scheduler: Scheduler, request_id: str, op: KVEditOp) -> PlannedEdit:
     """Validate ``op`` against the request and compute the cache mutations.
 
@@ -300,6 +380,8 @@ def plan_edit(scheduler: Scheduler, request_id: str, op: KVEditOp) -> PlannedEdi
 
     Raises:
         KeyError: unknown request id.
+        StaleSpanError: the request's (or a splice source's) slot count is
+            not the op's expected one.
         ValueError: the request has no editable cache, a span is out of
             range, the result has an invalid position layout, or the pool
             has too few free blocks.
@@ -307,6 +389,7 @@ def plan_edit(scheduler: Scheduler, request_id: str, op: KVEditOp) -> PlannedEdi
     """
     request = _editable_request(scheduler, request_id)
     num_slots = request.num_computed_tokens
+    _check_expected_num_slots(request, op.expected_num_slots)
     managers = _managers(scheduler)
     request_blocks = [_request_blocks(manager, request) for _, manager in managers]
     views = _request_views(managers, request_blocks, _positions_of(request))
@@ -315,6 +398,7 @@ def plan_edit(scheduler: Scheduler, request_id: str, op: KVEditOp) -> PlannedEdi
     new_tokens: list[int] = []
     if isinstance(op, SpliceOp):
         source = _editable_request(scheduler, op.src_request_id)
+        _check_expected_num_slots(source, op.expected_src_num_slots)
         src_blocks = [_request_blocks(manager, source) for _, manager in managers]
         src_views = _request_views(managers, src_blocks, _positions_of(source))
         # Validate the spans before taking blocks from the pool; splice()
@@ -448,9 +532,10 @@ def commit_edit(scheduler: Scheduler, planned: PlannedEdit) -> KVEditResult:
     request = planned.request
     request_id = request.request_id
     if request.num_computed_tokens != planned.num_slots_before:
-        # Cannot happen with synchronous scheduling (nothing runs between
-        # plan and commit inside one utility call); if it ever does, the
-        # worker pass has already run and the request's cache is suspect.
+        # Cannot happen: the core drains its batch queue before planning and
+        # nothing runs between plan and commit inside one utility call. If
+        # it ever does, the worker pass has already run and the request's
+        # cache is suspect.
         release(scheduler, planned)
         raise RuntimeError(
             f"{request_id}: request changed between planning and committing; "

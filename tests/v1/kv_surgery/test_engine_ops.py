@@ -4,6 +4,8 @@
 block sharing. No model forward; a GPU is only needed to build VllmConfig."""
 
 import time
+from collections import deque
+from dataclasses import fields, replace
 
 import msgspec
 import msgspec.msgpack
@@ -11,6 +13,14 @@ import numpy as np
 import pytest
 
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import utility_failure_prefix
+from vllm.v1.engine.core import EngineCore
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    SinkFullAttentionSpec,
+    SlidingWindowSpec,
+)
 from vllm.v1.kv_surgery.engine_ops import (
     commit_edit,
     commit_fork,
@@ -18,7 +28,15 @@ from vllm.v1.kv_surgery.engine_ops import (
     plan_edit,
     plan_fork,
 )
-from vllm.v1.kv_surgery.ops import DropOp, KVEditOp, ShiftOp, SpliceOp, as_edit_op
+from vllm.v1.kv_surgery.ops import (
+    DropOp,
+    KVEditOp,
+    ShiftOp,
+    SpliceOp,
+    StaleSpanError,
+    as_edit_op,
+    stale_span_errors_restored,
+)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -208,6 +226,120 @@ def test_fractional_next_position_is_rejected(scheduler, running_request):
     n = request.num_computed_tokens
     with pytest.raises(ValueError, match="not an integer"):
         plan_edit(scheduler, request.request_id, ShiftOp(n - 4, n, 0.5))
+
+
+def test_stale_expected_num_slots_is_rejected(scheduler, running_request):
+    """A span computed before the request decoded again is refused before
+    any block moves; the matching count goes through."""
+    request = running_request
+    n = request.num_computed_tokens
+    blocks_before = _blocks(scheduler, request)
+    with pytest.raises(StaleSpanError, match=f"expected {n - 1} computed slots"):
+        plan_edit(
+            scheduler,
+            request.request_id,
+            DropOp(n - 3, n - 1, expected_num_slots=n - 1),
+        )
+    with pytest.raises(StaleSpanError, match=f"expected {n - 1} computed slots"):
+        plan_edit(
+            scheduler,
+            request.request_id,
+            SpliceOp(n - 3, n, request.request_id, 0, 1, expected_src_num_slots=n - 1),
+        )
+    assert _blocks(scheduler, request) == blocks_before
+    planned = plan_edit(
+        scheduler, request.request_id, DropOp(n - 3, n, expected_num_slots=n)
+    )
+    assert commit_edit(scheduler, planned).num_slots == n - 3
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Exception(utility_failure_prefix("fork_kv") + "stale span: r: expected 1"),
+        RuntimeError(utility_failure_prefix("edit_kv") + "stale span: r: expected 1"),
+        Exception(utility_failure_prefix("edit_kv") + "no request r (stale span: )"),
+    ],
+)
+def test_only_a_wrapped_edit_kv_stale_span_is_restored(error):
+    """The multiprocess client sees a utility failure as a plain Exception
+    with the core's message; only edit_kv's stale-span one is converted."""
+    wrapped = Exception(utility_failure_prefix("edit_kv") + "stale span: r: expected 1")
+    with (
+        pytest.raises(StaleSpanError, match="^stale span: r: expected 1$"),
+        stale_span_errors_restored(),
+    ):
+        raise wrapped
+    with pytest.raises(type(error)) as info, stale_span_errors_restored():
+        raise error
+    assert info.value is error
+
+
+def test_sliding_window_allocation_is_rejected(scheduler, running_request, monkeypatch):
+    """A window group evicts rows (null blocks), so a view over it is
+    incomplete; the hybrid manager must be disabled for such models."""
+    groups = scheduler.kv_cache_config.kv_cache_groups
+    spec = groups[0].kv_cache_spec
+    assert isinstance(spec, FullAttentionSpec)
+    window_spec = SlidingWindowSpec(
+        block_size=spec.block_size,
+        num_kv_heads=spec.num_kv_heads,
+        head_size=spec.head_size,
+        dtype=spec.dtype,
+        sliding_window=BLOCK_SIZE,
+    )
+    monkeypatch.setattr(
+        scheduler.kv_cache_config,
+        "kv_cache_groups",
+        [KVCacheGroupSpec(groups[0].layer_names, window_spec), *groups[1:]],
+    )
+    with pytest.raises(NotImplementedError, match="disable_hybrid_kv_cache_manager"):
+        plan_edit(scheduler, running_request.request_id, DropOp(0, 1))
+
+
+def test_unreviewed_full_attention_subclass_is_rejected(
+    scheduler, running_request, monkeypatch
+):
+    """Only the exact full-attention and MLA spec types are allowed; a
+    subclass nobody has looked at for surgery (attention sinks) is not."""
+    groups = scheduler.kv_cache_config.kv_cache_groups
+    spec = groups[0].kv_cache_spec
+    sink = SinkFullAttentionSpec(
+        **{f.name: getattr(spec, f.name) for f in fields(spec)}, sink_len=4
+    )
+    monkeypatch.setattr(
+        scheduler.kv_cache_config,
+        "kv_cache_groups",
+        [KVCacheGroupSpec(groups[0].layer_names, sink), *groups[1:]],
+    )
+    with pytest.raises(NotImplementedError, match="SinkFullAttentionSpec"):
+        plan_edit(scheduler, running_request.request_id, DropOp(0, 1))
+
+
+def test_chunked_local_attention_is_rejected(scheduler, running_request, monkeypatch):
+    """Chunk boundaries under a drop or shift are untested (Llama 4)."""
+    groups = scheduler.kv_cache_config.kv_cache_groups
+    chunked = replace(groups[0].kv_cache_spec, attention_chunk_size=BLOCK_SIZE)
+    monkeypatch.setattr(
+        scheduler.kv_cache_config,
+        "kv_cache_groups",
+        [KVCacheGroupSpec(groups[0].layer_names, chunked), *groups[1:]],
+    )
+    with pytest.raises(NotImplementedError, match="chunked local"):
+        plan_edit(scheduler, running_request.request_id, DropOp(0, 1))
+
+
+def test_compressed_kv_states_are_rejected(scheduler, running_request, monkeypatch):
+    """DeepSeek V4 compressed layers keep one state per token group."""
+    groups = scheduler.kv_cache_config.kv_cache_groups
+    compressed = replace(groups[0].kv_cache_spec, tokens_per_state=4)
+    monkeypatch.setattr(
+        scheduler.kv_cache_config,
+        "kv_cache_groups",
+        [KVCacheGroupSpec(groups[0].layer_names, compressed), *groups[1:]],
+    )
+    with pytest.raises(NotImplementedError, match="tokens per state"):
+        plan_edit(scheduler, running_request.request_id, DropOp(0, 1))
 
 
 def test_span_and_request_validation(scheduler, running_request):
@@ -523,3 +655,22 @@ def test_splice_validation_releases_blocks_it_took(scheduler, running_request):
         plan_edit(scheduler, source.request_id, SpliceOp(n, n, "fork", 0, 17))
     pool.free_blocks(reversed(hoard))
     assert _free_blocks(scheduler) == free_before
+
+
+def test_failed_drain_is_fatal_at_the_next_step():
+    """A model failure that a drain surfaces inside a utility call (which
+    only reports errors to its caller) still reaches the engine's failure
+    path: the next step re-raises it, and so does any later drain."""
+    core = object.__new__(EngineCore)
+    core.batch_queue = deque([object()])
+    core._drained_outputs = deque()
+    core._drain_error = None
+
+    def fail():
+        raise RuntimeError("model failed")
+
+    core._finish_oldest_batch = fail  # type: ignore[method-assign]
+    drain, step = core._drain_batch_queue, core.step_with_batch_queue
+    for call in (drain, step, drain):
+        with pytest.raises(RuntimeError, match="model failed"):
+            call()

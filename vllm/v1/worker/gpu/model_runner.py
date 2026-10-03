@@ -681,10 +681,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.kv_caches_by_layer = kv_caches_dict
         self.kv_surgery_descriptors: list[list[RopeDescriptor]] | None = None
+        self.kv_surgery_warm = False
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+
+    def _kv_surgery_descriptors_by_group(self) -> list[list[RopeDescriptor]]:
+        """RoPE descriptors per KV cache group, derived once from the model."""
+        if self.kv_surgery_descriptors is None:
+            by_layer = {
+                desc.layer_name: desc
+                for desc in derive_rope_descriptors(self.model, self.kv_caches_by_layer)
+            }
+            self.kv_surgery_descriptors = [
+                [by_layer[name] for name in group.layer_names]
+                for group in self.kv_cache_config.kv_cache_groups
+            ]
+        return self.kv_surgery_descriptors
 
     @torch.inference_mode()
     def apply_kv_edit(self, plans: list[EditPlan]) -> None:
@@ -695,22 +709,57 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         Request state is not touched here: the scheduler re-admits the edited
         request and ``add_requests`` rebuilds it from the scheduler's truth.
         """
-        if self.kv_surgery_descriptors is None:
-            by_layer = {
-                desc.layer_name: desc
-                for desc in derive_rope_descriptors(self.model, self.kv_caches_by_layer)
-            }
-            self.kv_surgery_descriptors = [
-                [by_layer[name] for name in group.layer_names]
-                for group in self.kv_cache_config.kv_cache_groups
-            ]
-        if len(plans) != len(self.kv_surgery_descriptors):
+        descriptors_by_group = self._kv_surgery_descriptors_by_group()
+        if len(plans) != len(descriptors_by_group):
             raise ValueError(
                 f"got {len(plans)} edit plans for "
-                f"{len(self.kv_surgery_descriptors)} KV cache groups"
+                f"{len(descriptors_by_group)} KV cache groups"
             )
-        for plan, descriptors in zip(plans, self.kv_surgery_descriptors):
+        for plan, descriptors in zip(plans, descriptors_by_group):
             apply_edit_plan(plan, descriptors)
+
+    @torch.inference_mode()
+    def warmup_kv_surgery(self) -> None:
+        """JIT-compile the surgery kernels at startup, before the JIT monitor
+        arms, so the first edit does not pay for it. ``VLLM_KV_SURGERY_WARMUP=0``
+        turns it off.
+
+        Copies slot 0 onto itself and rotates it by 0 on every layer: exact
+        no-ops, and slot 0 lives in the null block anyway. Skipped, with a
+        debug log, for engines and models surgery refuses by design (prefix
+        caching, PP, spec decode, connectors, unsupported RoPE, ...); any
+        other failure to derive the descriptors logs a warning. Either way the
+        first edit fails the same way. Never blocks startup: a kernel failure
+        logs an error with traceback (a launch that broke the CUDA context
+        fails the next forward pass loudly anyway). ``kv_surgery_warm``
+        records that both kernels ran here.
+        """
+        from vllm.v1.kv_surgery.engine_ops import check_config_supported
+
+        if not envs.VLLM_KV_SURGERY_WARMUP:
+            return
+        try:
+            check_config_supported(self.vllm_config)
+            descriptors_by_group = self._kv_surgery_descriptors_by_group()
+        except NotImplementedError as e:
+            logger.debug("KV surgery is unavailable: %s", e)
+            return
+        except Exception as e:
+            logger.warning("KV surgery is unavailable for this model: %r", e)
+            return
+        plan = EditPlan(
+            gather_src=np.zeros(1, dtype=np.int64),
+            gather_dst=np.zeros(1, dtype=np.int64),
+            rotate_slots=np.zeros(1, dtype=np.int64),
+            rotate_deltas=np.zeros(1, dtype=np.float64),
+        )
+        try:
+            for descriptors in descriptors_by_group:
+                apply_edit_plan(plan, descriptors)
+        except Exception:
+            logger.exception("KV surgery kernel warmup failed")
+            return
+        self.kv_surgery_warm = True
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""

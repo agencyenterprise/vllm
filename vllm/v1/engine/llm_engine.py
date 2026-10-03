@@ -34,7 +34,12 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
-from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult, KVViewInfo
+from vllm.v1.kv_surgery.ops import (
+    KVEditOp,
+    KVEditResult,
+    KVViewInfo,
+    stale_span_errors_restored,
+)
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
@@ -370,11 +375,14 @@ class LLMEngine:
         request (``RequestOutput.token_ids``, the detokenizer) is not
         updated by edits: dropped text stays in it and spliced-in tokens
         never appear; ``inspect_kv`` and the engine's history are the truth.
+        Compute spans from ``inspect_kv``, not from received outputs: the
+        engine can be ahead of them (see ``vllm.v1.kv_surgery.ops``).
         """
         request_id = self.output_processor.resolve_request_id(request_id)
-        return self.engine_core.edit_kv(
-            request_id, self.output_processor.resolve_edit_op(op)
-        )
+        with stale_span_errors_restored():
+            return self.engine_core.edit_kv(
+                request_id, self.output_processor.resolve_edit_op(op)
+            )
 
     def fork_request(
         self,

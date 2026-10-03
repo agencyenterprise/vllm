@@ -11,6 +11,11 @@ Ops (``ops.py``): ``DropOp``, ``ShiftOp`` and ``SpliceOp`` go through
 ``edit_kv``; ``fork_kv`` starts a request on a shared prefix of another one.
 Restricted prefill is a fork plus a splice; a probe is a fork with
 ``max_tokens=1`` and full-vocab logprobs.
+
+Targets: dense GQA and MLA (the rope-k slice of the latent row is what
+rotates), MoE, tensor parallelism (every rank applies the same plan to its
+shard), and hybrid sliding-window models with the hybrid KV cache manager
+disabled, so that every layer keeps a row for every slot.
 """
 
 from vllm.v1.kv_surgery.kernels import apply_edit_plan, gather_slots, rotate_slots
