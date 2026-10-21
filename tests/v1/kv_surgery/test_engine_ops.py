@@ -167,6 +167,21 @@ def test_drop_prompt_span_shrinks_everything_consistently(scheduler, running_req
     )
 
 
+def test_inspect_token_ids_follow_the_slots(scheduler, running_request):
+    """The token readout covers the computed slots only (not the sampled
+    token still waiting for its forward pass) and tracks a drop."""
+    request = running_request
+    rid = request.request_id
+    assert inspect_kv(scheduler, rid).token_ids is None
+    n = request.num_computed_tokens
+    tokens = list(request.all_token_ids)
+    assert len(tokens) == n + 1
+    assert inspect_kv(scheduler, rid, token_ids=True).token_ids == tokens[:n]
+    commit_edit(scheduler, plan_edit(scheduler, rid, DropOp(10, 20)))
+    expected = tokens[:10] + tokens[20:n]
+    assert inspect_kv(scheduler, rid, token_ids=True).token_ids == expected
+
+
 def test_running_request_is_readmitted_as_new_request_data(scheduler, running_request):
     request = running_request
     result = commit_edit(

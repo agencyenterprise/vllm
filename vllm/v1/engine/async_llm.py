@@ -1216,11 +1216,14 @@ class AsyncLLM(EngineClient):
                 # a paused fork's collector keeps taking its final output.
                 q.close()
 
-    async def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+    async def inspect_kv(
+        self, request_id: str, positions: bool = False, token_ids: bool = False
+    ) -> KVViewInfo:
         """Describe a live request's KV layout (slots, blocks, and with
-        ``positions`` the per-slot position list, which is context-sized)."""
+        ``positions`` / ``token_ids`` the per-slot position and token lists,
+        which are context-sized)."""
         request_id = self.output_processor.resolve_request_id(request_id)
-        return await self.engine_core.inspect_kv_async(request_id, positions)
+        return await self.engine_core.inspect_kv_async(request_id, positions, token_ids)
 
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:

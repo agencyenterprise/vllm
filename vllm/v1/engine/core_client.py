@@ -176,7 +176,9 @@ class EngineCoreClient(ABC):
     ) -> None:
         raise NotImplementedError
 
-    def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+    def inspect_kv(
+        self, request_id: str, positions: bool = False, token_ids: bool = False
+    ) -> KVViewInfo:
         raise NotImplementedError
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
@@ -283,7 +285,7 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def inspect_kv_async(
-        self, request_id: str, positions: bool = False
+        self, request_id: str, positions: bool = False, token_ids: bool = False
     ) -> KVViewInfo:
         raise NotImplementedError
 
@@ -393,9 +395,11 @@ class InprocClient(EngineCoreClient):
     ) -> None:
         self.engine_core.fork_kv(src_request_id, request, num_slots)
 
-    def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+    def inspect_kv(
+        self, request_id: str, positions: bool = False, token_ids: bool = False
+    ) -> KVViewInfo:
         return msgspec.convert(
-            self.engine_core.inspect_kv(request_id, positions), KVViewInfo
+            self.engine_core.inspect_kv(request_id, positions, token_ids), KVViewInfo
         )
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
@@ -992,9 +996,12 @@ class SyncMPClient(MPClient):
         # what its ADD path sends too.
         self.call_utility("fork_kv", src_request_id, request, num_slots)
 
-    def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+    def inspect_kv(
+        self, request_id: str, positions: bool = False, token_ids: bool = False
+    ) -> KVViewInfo:
         return msgspec.convert(
-            self.call_utility("inspect_kv", request_id, positions), KVViewInfo
+            self.call_utility("inspect_kv", request_id, positions, token_ids),
+            KVViewInfo,
         )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -1268,10 +1275,12 @@ class AsyncMPClient(MPClient):
         await self.call_utility_async("fork_kv", src_request_id, request, num_slots)
 
     async def inspect_kv_async(
-        self, request_id: str, positions: bool = False
+        self, request_id: str, positions: bool = False, token_ids: bool = False
     ) -> KVViewInfo:
         return msgspec.convert(
-            await self.call_utility_async("inspect_kv", request_id, positions),
+            await self.call_utility_async(
+                "inspect_kv", request_id, positions, token_ids
+            ),
             KVViewInfo,
         )
 

@@ -742,12 +742,16 @@ def rollback_fork(scheduler: Scheduler, planned: PlannedFork) -> None:
 
 
 def inspect_kv(
-    scheduler: Scheduler, request_id: str, positions: bool = False
+    scheduler: Scheduler,
+    request_id: str,
+    positions: bool = False,
+    token_ids: bool = False,
 ) -> KVViewInfo:
     """Describe a live request's KV layout. Read-only.
 
-    ``positions`` asks for the per-slot position list, which is as long as
-    the context and crosses the utility RPC; leave it off when polling.
+    ``positions`` and ``token_ids`` ask for the per-slot position and token
+    lists, which are as long as the context and cross the utility RPC; leave
+    them off when polling.
 
     ``num_shared_blocks`` counts, per KV cache group, the blocks referenced by
     more than one request: fork-shared blocks when prefix caching is off (the
@@ -778,6 +782,9 @@ def inspect_kv(
         num_prompt_tokens=request.num_prompt_tokens,
         next_position=request.num_computed_tokens + request.position_offset,
         positions=_positions_of(request).tolist() if positions else None,
+        token_ids=(
+            request.all_token_ids[: request.num_computed_tokens] if token_ids else None
+        ),
         block_ids=block_ids,
         num_shared_blocks=num_shared,
     )

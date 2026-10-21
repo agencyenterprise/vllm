@@ -159,6 +159,10 @@ class KVViewInfo(msgspec.Struct, frozen=True):  # type: ignore[call-arg]
     positions: list[float] | None
     """RoPE position of each computed slot, in logical order; only when
     asked for (``inspect_kv(..., positions=True)``)."""
+    token_ids: list[int] | None
+    """Token id of each computed slot, in logical order (the engine's token
+    history, which edits keep in step with the slots); only when asked for
+    (``inspect_kv(..., token_ids=True)``)."""
     block_ids: list[list[int]]
     """Block table per KV cache group."""
     num_shared_blocks: list[int]

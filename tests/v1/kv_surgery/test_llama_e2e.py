@@ -19,8 +19,9 @@ import pytest
 import torch
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.engine.protocol import StreamingInput
 from vllm.envs import disable_envs_cache
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.kv_surgery.ops import (
@@ -409,5 +410,108 @@ async def test_fork_probe_and_splice_over_async_llm(prompt_ids):
         await engine.abort("ctx")
         await context
         assert outputs[-1].finished
+    finally:
+        engine.shutdown()
+
+
+class StreamingSession:
+    """One resumable streaming request, driven a chunk (turn) at a time: the
+    shape of a chat context. Each turn prefills its chunk, then generates
+    until ``max_tokens`` and pauses (WAITING_FOR_STREAMING_REQ)."""
+
+    def __init__(self, engine: AsyncLLM, request_id: str, max_tokens: int):
+        self.engine = engine
+        self.request_id = request_id
+        self.inputs: asyncio.Queue[list[int] | None] = asyncio.Queue()
+        params = SamplingParams(
+            temperature=0.0,
+            max_tokens=max_tokens,
+            ignore_eos=True,
+            output_kind=RequestOutputKind.DELTA,
+        )
+        self.outputs = engine.generate(self._chunks(), params, request_id)
+
+    async def _chunks(self):
+        while (tokens := await self.inputs.get()) is not None:
+            yield StreamingInput({"prompt_token_ids": tokens})
+
+    async def turn(self, tokens: list[int]) -> list[int]:
+        """Append ``tokens`` and return what the model generated for them."""
+        self.inputs.put_nowait(tokens)
+        generated: list[int] = []
+        while True:
+            out = await anext(self.outputs)
+            generated += out.outputs[0].token_ids
+            if out.outputs[0].finish_reason is not None:
+                assert not out.finished
+                return generated
+
+    async def tokens(self) -> list[int]:
+        info = await self.engine.inspect_kv(self.request_id, token_ids=True)
+        assert info.token_ids is not None
+        return info.token_ids
+
+    async def close(self) -> None:
+        self.inputs.put_nowait(None)
+        async for out in self.outputs:
+            pass
+        assert out.finished
+
+
+@pytest.mark.asyncio
+async def test_drops_between_turns_of_a_streaming_session(prompt_ids):
+    """A chat context is one resumable streaming request. An edit between
+    turns sticks: the next turn's chunk lands after the edited context.
+
+    Each turn's last sampled token never reaches the KV (the engine discards
+    it when the next chunk arrives), so the context after a turn is its
+    chunk plus all but the last generated token. A tail drop is a rollback,
+    so a turn after one must continue exactly like a fresh request."""
+    disable_envs_cache()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+        mp.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        engine = AsyncLLM.from_engine_args(
+            AsyncEngineArgs(
+                model=MODEL,
+                enable_prefix_caching=False,
+                max_model_len=1024,
+                max_num_seqs=8,
+                gpu_memory_utilization=0.3,
+                seed=0,
+            )
+        )
+    try:
+        first, second = prompt_ids[:40], prompt_ids[40:52]
+
+        # A middle drop between turns: the context shrinks by the span and the
+        # next chunk appends after it, at contiguous positions.
+        chat = StreamingSession(engine, "chat", max_tokens=4)
+        g1 = await chat.turn(first)
+        assert len(g1) == 4
+        info = await engine.inspect_kv("chat")
+        assert info.status == "WAITING_FOR_STREAMING_REQ"
+        assert await chat.tokens() == first + g1[:3]
+        result = await engine.edit_kv("chat", DropOp(5, 15))
+        assert result.num_slots == len(first) + 3 - 10
+        g2 = await chat.turn(second)
+        expected = first[:5] + first[15:] + g1[:3] + second + g2[:3]
+        assert await chat.tokens() == expected
+        info = await engine.inspect_kv("chat", positions=True)
+        assert info.positions == [float(p) for p in range(len(expected))]
+        await chat.close()
+
+        # A tail drop between turns (this turn's generated tokens) is a
+        # rollback: the next turn continues like a fresh request.
+        chat = StreamingSession(engine, "rollback", max_tokens=4)
+        n = len(first) + 3
+        await chat.turn(first)
+        await engine.edit_kv("rollback", DropOp(len(first), n, expected_num_slots=n))
+        assert await chat.tokens() == first
+        continued = await chat.turn(second)
+        await chat.close()
+        fresh = StreamingSession(engine, "fresh", max_tokens=4)
+        assert continued == await fresh.turn(first + second)
+        await fresh.close()
     finally:
         engine.shutdown()

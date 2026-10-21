@@ -951,7 +951,9 @@ class EngineCore:
             rollback_fork(self.scheduler, planned)
             raise
 
-    def inspect_kv(self, request_id: str, positions: bool = False) -> dict[str, Any]:
+    def inspect_kv(
+        self, request_id: str, positions: bool = False, token_ids: bool = False
+    ) -> dict[str, Any]:
         """Describe a live request's KV layout (``KVViewInfo`` as a dict).
 
         Under async scheduling, if a queued batch schedules this request, this
@@ -966,7 +968,9 @@ class EngineCore:
             for _, scheduler_output, _ in self.batch_queue
         ):
             self._drain_batch_queue()
-        return msgspec.to_builtins(inspect_kv(self.scheduler, request_id, positions))
+        return msgspec.to_builtins(
+            inspect_kv(self.scheduler, request_id, positions, token_ids)
+        )
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

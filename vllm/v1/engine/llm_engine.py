@@ -457,11 +457,14 @@ class LLMEngine:
             raise
         return request.request_id
 
-    def inspect_kv(self, request_id: str, positions: bool = False) -> KVViewInfo:
+    def inspect_kv(
+        self, request_id: str, positions: bool = False, token_ids: bool = False
+    ) -> KVViewInfo:
         """Describe a live request's KV layout (slots, blocks, and with
-        ``positions`` the per-slot position list, which is context-sized)."""
+        ``positions`` / ``token_ids`` the per-slot position and token lists,
+        which are context-sized)."""
         request_id = self.output_processor.resolve_request_id(request_id)
-        return self.engine_core.inspect_kv(request_id, positions)
+        return self.engine_core.inspect_kv(request_id, positions, token_ids)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
