@@ -437,7 +437,10 @@ class StreamingSession:
 
     async def turn(self, tokens: list[int]) -> list[int]:
         """Append ``tokens`` and return what the model generated for them."""
-        self.inputs.put_nowait(tokens)
+        # The frontend's request state keeps the first chunk's list and
+        # extends it in place with every later chunk (stock
+        # OutputProcessor.apply_streaming_update), so hand it a copy.
+        self.inputs.put_nowait(list(tokens))
         generated: list[int] = []
         while True:
             out = await anext(self.outputs)
@@ -452,10 +455,10 @@ class StreamingSession:
         return info.token_ids
 
     async def close(self) -> None:
+        """End the session; the stream may end without a further output."""
         self.inputs.put_nowait(None)
-        async for out in self.outputs:
+        async for _ in self.outputs:
             pass
-        assert out.finished
 
 
 @pytest.mark.asyncio
