@@ -63,7 +63,13 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
 )
-from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult, KVViewInfo
+from vllm.v1.kv_surgery.ops import (
+    KVEditLostError,
+    KVEditOp,
+    KVEditResult,
+    KVViewInfo,
+    StaleSpanError,
+)
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -832,6 +838,33 @@ class MPClient(EngineCoreClient):
                 assert response.dp_stats_address == self.stats_update_address
 
 
+# Exception types a failed utility call is re-raised as on the client, by the
+# name the core reports (UtilityOutput.failure_type). Anything else, including
+# a core that reports no type, surfaces as a plain Exception as before. Only
+# types whose constructor takes the message alone belong here.
+_RESTORED_UTILITY_ERRORS: dict[str, type[Exception]] = {
+    cls.__name__: cls
+    for cls in (
+        KeyError,
+        ValueError,
+        TypeError,
+        NotImplementedError,
+        RuntimeError,
+        StaleSpanError,
+        KVEditLostError,
+    )
+}
+
+
+def restore_utility_error(failure_message: str, failure_type: str | None) -> Exception:
+    """The exception a failed utility call raises on the client: the core's
+    type when it is a known one (so KV surgery callers can catch
+    ``StaleSpanError``, ``KeyError`` ... with either engine core), else a
+    plain ``Exception`` carrying the message."""
+    cls = _RESTORED_UTILITY_ERRORS.get(failure_type or "", Exception)
+    return cls(failure_message)
+
+
 def _process_utility_output(
     output: UtilityOutput, utility_results: dict[int, AnyFuture]
 ):
@@ -840,7 +873,9 @@ def _process_utility_output(
     failure_message = output.failure_message
     try:
         if failure_message is not None:
-            future.set_exception(Exception(failure_message))
+            future.set_exception(
+                restore_utility_error(failure_message, output.failure_type)
+            )
         else:
             assert output.result is not None
             future.set_result(output.result.result)

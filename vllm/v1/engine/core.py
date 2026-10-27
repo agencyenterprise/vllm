@@ -1786,6 +1786,7 @@ class EngineCoreProc(EngineCore):
         except Exception as e:
             logger.exception("Invocation of %s method failed", name)
             output.failure_message = utility_failure_prefix(name) + str(e)
+            output.failure_type = type(e).__name__
         enqueue_output(output)
 
     @staticmethod

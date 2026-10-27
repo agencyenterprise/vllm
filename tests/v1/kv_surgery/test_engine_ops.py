@@ -13,8 +13,9 @@ import numpy as np
 import pytest
 
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import utility_failure_prefix
+from vllm.v1.engine import FinishReason, utility_failure_prefix
 from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.core_client import restore_utility_error
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -30,12 +31,12 @@ from vllm.v1.kv_surgery.engine_ops import (
 )
 from vllm.v1.kv_surgery.ops import (
     DropOp,
+    KVEditLostError,
     KVEditOp,
     ShiftOp,
     SpliceOp,
     StaleSpanError,
     as_edit_op,
-    stale_span_errors_restored,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -269,25 +270,25 @@ def test_stale_expected_num_slots_is_rejected(scheduler, running_request):
 
 
 @pytest.mark.parametrize(
-    "error",
+    ("failure_type", "expected"),
     [
-        Exception(utility_failure_prefix("fork_kv") + "stale span: r: expected 1"),
-        RuntimeError(utility_failure_prefix("edit_kv") + "stale span: r: expected 1"),
-        Exception(utility_failure_prefix("edit_kv") + "no request r (stale span: )"),
+        ("StaleSpanError", StaleSpanError),
+        ("KVEditLostError", KVEditLostError),
+        ("KeyError", KeyError),
+        ("NotImplementedError", NotImplementedError),
+        ("SomeInternalError", Exception),
+        (None, Exception),
     ],
 )
-def test_only_a_wrapped_edit_kv_stale_span_is_restored(error):
-    """The multiprocess client sees a utility failure as a plain Exception
-    with the core's message; only edit_kv's stale-span one is converted."""
-    wrapped = Exception(utility_failure_prefix("edit_kv") + "stale span: r: expected 1")
-    with (
-        pytest.raises(StaleSpanError, match="^stale span: r: expected 1$"),
-        stale_span_errors_restored(),
-    ):
-        raise wrapped
-    with pytest.raises(type(error)) as info, stale_span_errors_restored():
-        raise error
-    assert info.value is error
+def test_utility_failures_keep_a_known_type_across_the_rpc(failure_type, expected):
+    """The core reports a failed utility call as message plus exception class
+    name; the client re-raises the known surgery-facing types (so a caller
+    can catch a stale span or a lost request with either engine core) and
+    anything else as the plain Exception it always was."""
+    message = utility_failure_prefix("edit_kv") + "stale span: r: expected 1"
+    error = restore_utility_error(message, failure_type)
+    assert type(error) is expected
+    assert message in str(error)
 
 
 def test_sliding_window_allocation_is_rejected(scheduler, running_request, monkeypatch):
@@ -391,38 +392,141 @@ def test_drop_straddling_prompt_boundary_keeps_classification(
     assert request.num_computed_tokens == PROMPT_LEN - 3
 
 
-def test_preemption_forgets_the_edited_layout(scheduler, running_request):
+def _finished_outputs(scheduler: Scheduler) -> dict[str, FinishReason]:
+    """One empty step; the finish reasons it reports, by request id."""
+    output = scheduler.schedule()
+    req_ids = list(output.num_scheduled_tokens)
+    outs = scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=[[0] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    return {
+        out.request_id: out.finish_reason
+        for eco in outs.values()
+        for out in eco.outputs
+        if out.finish_reason is not None
+    }
+
+
+def test_preempting_an_edited_request_finishes_it_as_kv_edit_lost(
+    scheduler, running_request
+):
+    """Recomputing an edited request from its tokens would be a clean prefill
+    that never saw the edit: valid-looking, wrong data. The scheduler finishes
+    it instead, frees everything, and reports the reason at the next step."""
     request = running_request
     n = request.num_computed_tokens
     commit_edit(scheduler, plan_edit(scheduler, request.request_id, ShiftOp(0, n, 7)))
     scheduler.schedule()  # re-admitted, RUNNING again
+    held = len(_blocks(scheduler, request))
+    free_before = _free_blocks(scheduler)
+
     scheduler.running.remove(request)
     scheduler._preempt_request(request, time.time())
-    assert request.kv_positions is None
-    assert request.position_offset == 0
+    assert request.status == RequestStatus.FINISHED_KV_EDIT_LOST
+    assert request.request_id not in scheduler.requests
+    assert request.request_id in scheduler.finished_req_ids
+    assert not scheduler.waiting and not scheduler.running
+    assert _free_blocks(scheduler) == free_before + held
+    with pytest.raises(KeyError, match="unknown request"):
+        inspect_kv(scheduler, request.request_id)
+
+    assert _finished_outputs(scheduler) == {
+        request.request_id: FinishReason.KV_EDIT_LOST
+    }
+    assert _finished_outputs(scheduler) == {}  # reported once
 
 
-def test_preempting_a_fork_recomputes_it_consistently(scheduler, running_request):
-    """A preempted fork loses its blocks (shared ones just lose a reference)
-    and re-prefills its whole prefix-extended prompt with a stock layout, the
-    same treatment an edited request gets."""
+def test_preemption_of_an_unedited_request_is_stock(scheduler, running_request):
+    request = running_request
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, time.time())
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 0
+    assert scheduler.waiting.peek_request() is request
+    assert _finished_outputs(scheduler) == {}
+
+
+def test_preempting_a_fork_of_an_edited_source_loses_it_too(scheduler, running_request):
+    """A fork inherits the source's edited layout (its shared rows carry
+    edited keys), so preempting it is a lost edit; the source keeps its blocks
+    and merely loses the share."""
     source = running_request
     n = source.num_computed_tokens
     commit_edit(scheduler, plan_edit(scheduler, source.request_id, ShiftOp(0, n, 5)))
     _step(scheduler, source, 3000)
     fork = _fork(scheduler, source, [1, 2], num_slots=None)
-    assert fork.kv_positions is not None
+    assert fork.has_edited_kv_layout
     _step_many(scheduler, {source.request_id: 3001, "fork": 3002})
     assert inspect_kv(scheduler, source.request_id).num_shared_blocks == [2]
+    src_blocks = _blocks(scheduler, source)
 
     scheduler.running.remove(fork)
     scheduler._preempt_request(fork, time.time())
+    assert fork.status == RequestStatus.FINISHED_KV_EDIT_LOST
+    assert inspect_kv(scheduler, source.request_id).num_shared_blocks == [0]
+    assert _blocks(scheduler, source) == src_blocks
+    assert source.status == RequestStatus.RUNNING
+
+
+def test_preempting_a_fork_of_a_stock_source_recomputes_it(scheduler, running_request):
+    """A fork of an unedited request is stock itself: preemption re-prefills
+    its prefix-extended prompt, which reproduces the shared cache."""
+    source = running_request
+    n = source.num_computed_tokens
+    fork = _fork(scheduler, source, [1, 2], num_slots=None)
+    assert not fork.has_edited_kv_layout
+    _step_many(scheduler, {source.request_id: 3001, "fork": 3002})
+
+    scheduler.running.remove(fork)
+    scheduler._preempt_request(fork, time.time())
+    assert fork.status == RequestStatus.PREEMPTED
     assert fork.num_computed_tokens == 0
-    assert fork.kv_positions is None
-    assert fork.position_offset == 0
     assert inspect_kv(scheduler, source.request_id).num_shared_blocks == [0]
     assert _blocks(scheduler, fork) == []
     assert list(fork.prompt_token_ids)[: n + 1] == list(source.all_token_ids)[: n + 1]
+
+
+def test_scheduler_preempts_the_edited_request_but_never_a_paused_one(
+    scheduler, running_request
+):
+    """With the pool exhausted the scheduler preempts running requests, the
+    most recently admitted first; a paused resumable fork is not running and
+    keeps every block. The edited victim is reported as kv_edit_lost."""
+    source = running_request
+    fork = _fork(scheduler, source, [1], num_slots=None)
+    fork.resumable = True
+    fork.max_tokens = 1
+    _step_many(scheduler, {source.request_id: 3001, "fork": 3002})
+    assert fork.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    fork_blocks = _blocks(scheduler, fork)
+
+    # A long request takes most of the pool; the edit re-admits the source
+    # after it, so the source is the first preemption victim.
+    free = _free_blocks(scheduler)
+    long = _new_request(list(range(10_000, 10_000 + (free - 2) * BLOCK_SIZE)), "long")
+    long.max_tokens = 10_000
+    scheduler.add_request(long)
+    n = source.num_computed_tokens
+    commit_edit(scheduler, plan_edit(scheduler, source.request_id, ShiftOp(0, n, 3)))
+
+    finished: dict[str, FinishReason] = {}
+    for _ in range(4 * BLOCK_SIZE):
+        finished.update(_finished_outputs(scheduler))
+        if finished:
+            break
+    assert finished == {source.request_id: FinishReason.KV_EDIT_LOST}
+    assert long.status == RequestStatus.RUNNING
+    assert fork.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert _blocks(scheduler, fork) == fork_blocks
+    assert inspect_kv(scheduler, "fork").num_slots == n + 1
 
 
 def test_ops_survive_the_utility_rpc_encoding():

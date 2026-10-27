@@ -221,6 +221,10 @@ class Scheduler(SchedulerInterface):
         # update_from_output.
         self.grammar_compile_error_reqs: set[str] = set()
 
+        # KV surgery: requests finished by preemption (their edited cache
+        # cannot be recomputed), reported in the next update_from_output.
+        self.kv_edit_lost_reqs: list[Request] = []
+
         # Encoder-related.
         # Calculate encoder cache size if applicable
         supports_mm_inputs = mm_registry.supports_multimodal_inputs(
@@ -1418,12 +1422,14 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if request.has_edited_kv_layout:
+            self._finish_kv_edit_lost(request, timestamp)
+            return
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
-        request.reset_kv_surgery_layout()
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -1445,6 +1451,30 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
+
+    def _finish_kv_edit_lost(self, request: Request, timestamp: float) -> None:
+        """Preemption of a request whose KV cache was edited (KV surgery).
+
+        A preempted request is recomputed from its token ids, which for an
+        edited cache would be a clean prefill that never saw the edits: a
+        valid-looking state the caller's record does not describe. The
+        request is finished instead, with ``FinishReason.KV_EDIT_LOST``; the
+        output reaches the client from the next ``update_from_output``.
+        Paused resumable requests (WAITING_FOR_STREAMING_REQ) are never
+        preempted: only ``running`` requests are, and a paused request is not
+        in it. Any in-flight output of this request is dropped with it.
+        """
+        logger.warning(
+            "%s: preempted with an edited KV cache, which cannot be "
+            "recomputed; finishing it (kv_edit_lost) instead of resuming it",
+            request.request_id,
+        )
+        request.num_preemptions += 1
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        request.status = RequestStatus.FINISHED_KV_EDIT_LOST
+        self._free_request(request)
+        self.kv_edit_lost_reqs.append(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -2143,6 +2173,20 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                     )
                 )
+
+        if self.kv_edit_lost_reqs:
+            # Already finished and freed by _finish_kv_edit_lost.
+            for request in self.kv_edit_lost_reqs:
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=request.get_finished_reason(),
+                        events=request.take_events(),
+                        trace_headers=request.trace_headers,
+                    )
+                )
+            self.kv_edit_lost_reqs.clear()
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:

@@ -32,7 +32,14 @@ PauseMode = Literal["abort", "wait", "keep"]
 
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.
-FINISH_REASON_STRINGS = ("stop", "length", "abort", "error", "repetition")
+FINISH_REASON_STRINGS = (
+    "stop",
+    "length",
+    "abort",
+    "error",
+    "repetition",
+    "kv_edit_lost",
+)
 
 EEP_NOTIFICATION_CALL_ID = -1
 
@@ -56,6 +63,9 @@ class FinishReason(enum.IntEnum):
     error - retryable request-level internal error (e.g., KV load failure).
             Invariant: always converted to 500 Internal Server Error.
     repetition - repetitive token pattern detected (hallucination)
+    kv_edit_lost - a request with an edited KV cache (vllm.v1.kv_surgery) was
+            preempted; its cache cannot be recomputed from its tokens, so the
+            request is finished instead of resumed.
 
     """
 
@@ -64,6 +74,7 @@ class FinishReason(enum.IntEnum):
     ABORT = 2
     ERROR = 3
     REPETITION = 4
+    KV_EDIT_LOST = 5
 
     def __str__(self):
         return FINISH_REASON_STRINGS[self.value]
@@ -248,6 +259,9 @@ class UtilityOutput(
     # Non-None implies the call failed, result should be None.
     failure_message: str | None = None
     result: UtilityResult | None = None
+    # Class name of the exception behind failure_message, so the client can
+    # re-raise a known type (see core_client.restore_utility_error).
+    failure_type: str | None = None
 
 
 def utility_failure_prefix(method_name: str) -> str:

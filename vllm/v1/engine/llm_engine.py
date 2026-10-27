@@ -34,12 +34,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
-from vllm.v1.kv_surgery.ops import (
-    KVEditOp,
-    KVEditResult,
-    KVViewInfo,
-    stale_span_errors_restored,
-)
+from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult, KVViewInfo
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
 from vllm.v1.metrics.stats import IterationStats
@@ -233,7 +228,13 @@ class LLMEngine:
         priority: int = 0,
         session_id: str | None = None,
         prompt_text: str | None = None,
+        resumable: bool = False,
     ) -> str:
+        """Add a request. ``resumable=True`` makes it a streaming session: at
+        its first stop it pauses (``WAITING_FOR_STREAMING_REQ``) with its KV
+        cache intact, until a later ``add_request`` with the same id appends
+        the next chunk (``resumable=False`` on that chunk ends the session).
+        Returns the internal request id."""
         # Validate the request_id type.
         if not isinstance(request_id, str):
             raise TypeError(f"request_id must be a string, got {type(request_id)}")
@@ -265,6 +266,7 @@ class LLMEngine:
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,
+                resumable=resumable,
                 session_id=session_id,
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
@@ -377,12 +379,25 @@ class LLMEngine:
         never appear; ``inspect_kv`` and the engine's history are the truth.
         Compute spans from ``inspect_kv``, not from received outputs: the
         engine can be ahead of them (see ``vllm.v1.kv_surgery.ops``).
+
+        An edited request that the scheduler preempts (it ran out of KV
+        blocks for the running requests) cannot be recomputed from its
+        tokens, so it is finished with ``finish_reason="kv_edit_lost"`` and
+        later surgery calls on it raise ``KVEditLostError``. Paused
+        resumable requests are never preempted; running ones can be, so
+        either keep enough free blocks or edit paused requests only.
+
+        Raises:
+            KeyError: unknown request (``KVEditLostError`` if it was lost to
+                preemption).
+            StaleSpanError: an ``expected_num_slots`` precondition failed.
+            ValueError: a bad span or layout.
+            NotImplementedError: an unsupported configuration or request.
         """
         request_id = self.output_processor.resolve_request_id(request_id)
-        with stale_span_errors_restored():
-            return self.engine_core.edit_kv(
-                request_id, self.output_processor.resolve_edit_op(op)
-            )
+        return self.engine_core.edit_kv(
+            request_id, self.output_processor.resolve_edit_op(op)
+        )
 
     def fork_request(
         self,
@@ -414,12 +429,18 @@ class LLMEngine:
 
         The fork's outputs report ``prompt_token_ids`` as the appended tokens
         only, while the engine (``inspect_kv``) counts the shared prefix as
-        prompt too; ``prompt_logprobs`` are therefore not supported on forks.
-        A ``resumable`` fork is never freed on its own: it holds its KV cache
-        and the source's shared blocks until ``abort_request`` is called. If
-        a fork is preempted it recomputes its prefix from its own tokens,
-        which is not the source's cache when the source had been edited (a
-        warning is logged).
+        prompt too. ``prompt_logprobs`` are indexed over the appended tokens
+        alike: entry ``i`` is the distribution at appended token ``i`` given
+        the shared slots and appended tokens ``0..i-1``, with the token's
+        own logprob plus the top ``k``; entry ``0`` is ``None``, as for a
+        plain prompt's first token (the distribution after the last shared
+        slot is not kept). A ``resumable`` fork is never freed on its own:
+        it holds its KV cache and the source's shared blocks until
+        ``abort_request`` is called. A fork of an edited source has an
+        edited layout itself; if the scheduler preempts it, it is finished
+        with ``finish_reason="kv_edit_lost"`` like any edited request (see
+        ``edit_kv``), while a fork of a stock request recomputes its
+        prefix-extended prompt as stock vLLM would.
         Invalid forks (``n > 1``, pooling params, bad ``num_slots``, ...) are
         rejected by the engine core and raise here.
         Returns the internal request id of the fork.

@@ -342,14 +342,23 @@ class KimiK25ForConditionalGeneration(
         )
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
+        tower_quant_config = self._maybe_ignore_quant_config(quant_config)
+        mm_config = model_config.get_multimodal_config()
+        if mm_config.get_limit_per_prompt("vision_chunk") == 0:
+            # The tower becomes a placeholder (see _mark_tower_model) but its
+            # constructor still runs, and a quantized one validates the
+            # checkpoint's block layout against the TP shards of weights that
+            # are never loaded: MoonViT's 4304-wide MLP is not a multiple of
+            # the 128-row FP8 block once split 8 ways.
+            tower_quant_config = None
         # Build vision tower directly with KimiK25VisionConfig
         with self._mark_tower_model(vllm_config, "vision_chunk"):
             self.vision_tower = MoonViT3dPretrainedModel(
                 config.vision_config,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
+                quant_config=tower_quant_config,
                 prefix=maybe_prefix(prefix, "vision_tower"),
             )
-            if self._maybe_ignore_quant_config(quant_config) is not None:
+            if tower_quant_config is not None:
                 self.vision_tower = self.vision_tower.to(device=self.device)
             else:
                 self.vision_tower = self.vision_tower.to(
@@ -359,7 +368,7 @@ class KimiK25ForConditionalGeneration(
             self.mm_projector = KimiK25MultiModalProjector(
                 config=config.vision_config,
                 use_data_parallel=self.use_data_parallel,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
+                quant_config=tower_quant_config,
                 prefix=maybe_prefix(prefix, "mm_projector"),
             )
             self.mm_projector = self.mm_projector.to(

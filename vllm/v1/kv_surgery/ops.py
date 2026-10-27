@@ -20,12 +20,7 @@ drains (stop string, ``max_tokens``); the call then raises ``KeyError`` for
 it.
 """
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-
 import msgspec
-
-from vllm.v1.engine import utility_failure_prefix
 
 
 class _EditOpBase(msgspec.Struct, frozen=True, kw_only=True):  # type: ignore[call-arg]
@@ -105,23 +100,21 @@ class StaleSpanError(ValueError):
     """An op's ``expected_num_slots`` (or ``expected_src_num_slots``) did
     not match; nothing was changed, and recomputing the span from a fresh
     ``inspect_kv`` and retrying is safe. Raised by ``LLMEngine.edit_kv`` and
-    ``AsyncLLM.edit_kv`` with either engine core.
+    ``AsyncLLM.edit_kv`` with either engine core (a multiprocess core's
+    utility failures are re-raised with their type; see
+    ``core_client.restore_utility_error``).
     """
 
 
-@contextmanager
-def stale_span_errors_restored() -> Iterator[None]:
-    """Re-raise a multiprocess core's wrapped ``edit_kv`` stale-span failure
-    as the ``StaleSpanError`` it was. Utility errors cross the RPC as message
-    text only, so this is a stopgap until they keep their type."""
-    try:
-        yield
-    except Exception as e:
-        failed = utility_failure_prefix("edit_kv")
-        msg = str(e)
-        if type(e) is Exception and msg.startswith(failed + STALE_SPAN_PREFIX):
-            raise StaleSpanError(msg.removeprefix(failed)) from e
-        raise
+class KVEditLostError(KeyError):
+    """The request was finished by preemption while its KV cache was edited
+    (``FinishReason.KV_EDIT_LOST``): the cache could not be recomputed from
+    its tokens, so the engine dropped the request rather than resume it on a
+    clean prefill. Raised by ``edit_kv``, ``fork_request`` / ``fork`` and
+    ``inspect_kv`` for such a request until its id is reused. The frontend
+    remembers a bounded number of lost ids; a very old one raises the plain
+    ``KeyError`` of an unknown request instead.
+    """
 
 
 def as_edit_op(obj: object) -> KVEditOp:

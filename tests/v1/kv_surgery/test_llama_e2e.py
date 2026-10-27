@@ -13,6 +13,7 @@ for bookkeeping here; their semantics are step 3's oracle harness.
 """
 
 import asyncio
+from collections.abc import Sequence
 
 import numpy as np
 import pytest
@@ -26,6 +27,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.kv_surgery.ops import (
     DropOp,
+    KVEditLostError,
     KVEditOp,
     ShiftOp,
     SpliceOp,
@@ -48,7 +50,11 @@ PROMPT = (
 )
 
 
-def _make_engine(multiprocess: bool, tensor_parallel_size: int = 1) -> LLMEngine:
+def _make_engine(
+    multiprocess: bool,
+    tensor_parallel_size: int = 1,
+    num_gpu_blocks_override: int | None = None,
+) -> LLMEngine:
     args = EngineArgs(
         model=MODEL,
         tensor_parallel_size=tensor_parallel_size,
@@ -56,6 +62,7 @@ def _make_engine(multiprocess: bool, tensor_parallel_size: int = 1) -> LLMEngine
         max_model_len=1024,
         max_num_seqs=8,
         gpu_memory_utilization=0.3,
+        num_gpu_blocks_override=num_gpu_blocks_override,
         # edit_kv runs between steps and needs no batch in flight.
         async_scheduling=False,
         seed=0,
@@ -92,6 +99,7 @@ class Driver:
         self.req_id = req_id
         self.generated: list[int] = []
         self.finished = False
+        self.finish_reason: str | None = None
         # The engine core knows the request under an internal id; edit_kv
         # accepts either that or the id the caller used.
         self.core_req_id = engine.add_request(
@@ -108,6 +116,8 @@ class Driver:
             if out.request_id == self.req_id:
                 self.generated = list(out.outputs[0].token_ids)
                 self.finished |= out.finished
+                if out.finished:
+                    self.finish_reason = out.outputs[0].finish_reason
 
     def run_until(self, num_generated: int) -> None:
         while len(self.generated) < num_generated and not self.finished:
@@ -247,13 +257,14 @@ def test_edit_over_the_multiprocess_client(prompt_ids):
         assert result.num_tokens == n + 1
         # The unshifted tail keeps the next position at the slot count.
         assert result.next_position == n
-        with pytest.raises(Exception, match="span"):
+        with pytest.raises(ValueError, match="span"):
             driver.edit(DropOp(0, 10_000))
-        # The core wraps utility errors in a plain exception; the frontend
-        # restores the type so a caller can tell a stale span from a bug.
+        # Utility failures cross the RPC with their exception class name and
+        # are re-raised as that type, so a caller can tell a stale span from
+        # a bug with either engine core.
         with pytest.raises(StaleSpanError, match=f"expected {n - 1} computed slots"):
             driver.edit(ShiftOp(0, 1, 1.0, expected_num_slots=n - 1))
-        with pytest.raises(Exception, match="unknown request"):
+        with pytest.raises(KeyError, match="unknown request"):
             engine.edit_kv("never-added", ShiftOp(0, 1, 1.0))
 
         # fork_kv carries a whole EngineCoreRequest through the RPC and the
@@ -309,6 +320,176 @@ def test_edit_over_the_multiprocess_client(prompt_ids):
             driver.edit(SpliceOp(0, 0, "mp-fork", 0, 1))
         engine.engine_core.call_utility("resume_scheduler")
         assert len(driver.finish()) == 64
+    finally:
+        engine.engine_core.shutdown()
+
+
+def _run_fork(
+    engine: LLMEngine,
+    src_req_id: str,
+    req_id: str,
+    tokens: list[int],
+    params: SamplingParams,
+    num_slots: int,
+    drivers: Sequence[Driver] = (),
+):
+    """Fork, step until the fork finishes, and return its final output; other
+    requests' outputs are routed to their drivers meanwhile."""
+    engine.fork_request(
+        src_req_id, req_id, {"prompt_token_ids": tokens}, params, num_slots=num_slots
+    )
+    for _ in range(64):
+        for out in engine.step():
+            if out.request_id == req_id and out.finished:
+                return out
+            for driver in drivers:
+                if out.request_id == driver.req_id:
+                    driver.generated = list(out.outputs[0].token_ids)
+                    driver.finished |= out.finished
+    pytest.fail(f"fork {req_id} never finished")
+
+
+def test_fork_prompt_logprobs_are_indexed_over_the_appended_tokens(engine, prompt_ids):
+    """Teacher-forced scoring on a fork in one pass: ``prompt_logprobs`` cover
+    the appended tokens only (entry 0 is None like a plain prompt's), and
+    entry ``i`` is what a probe fork at the same place reports for token
+    ``i``, up to prefill-versus-decode kernel noise."""
+    source = Driver(engine, "plp-src", prompt_ids, 64)
+    source.run_until(2)
+    n = len(prompt_ids)
+    source.edit(
+        ShiftOp(0, n, 3, expected_num_slots=engine.inspect_kv("plp-src").num_slots)
+    )
+    appended = prompt_ids[:4]
+
+    out = _run_fork(
+        engine,
+        "plp-src",
+        "plp",
+        appended,
+        SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=2),
+        n,
+        [source],
+    )
+    assert list(out.prompt_token_ids) == appended
+    plp = out.prompt_logprobs
+    assert plp is not None and len(plp) == len(appended)
+    assert plp[0] is None
+    for i in range(1, len(appended)):
+        token = appended[i]
+        entry = plp[i]
+        assert token in entry
+        assert 2 <= len(entry) <= 3  # the token itself plus the top 2
+        assert all(lp.rank >= 1 for lp in entry.values())
+        probe = _run_fork(
+            engine,
+            "plp-src",
+            f"probe-{i}",
+            appended[:i],
+            SamplingParams(temperature=0.0, max_tokens=1, logprob_token_ids=[token]),
+            n,
+            [source],
+        )
+        probe_lp = probe.outputs[0].logprobs[0][token].logprob
+        assert abs(entry[token].logprob - probe_lp) < 0.1, (i, entry[token], probe_lp)
+    assert len(source.finish()) == 64
+
+
+def test_paused_fork_does_not_count_as_unfinished(engine, prompt_ids):
+    """``LLM.generate`` loops while the engine has unfinished requests; a
+    paused resumable fork (a kept checkpoint) must not keep it looping."""
+    driver = Driver(engine, "busy-src", prompt_ids, 8)
+    driver.run_until(1)
+    n = len(prompt_ids)
+    engine.fork_request(
+        "busy-src",
+        "paused",
+        {"prompt_token_ids": prompt_ids[:2]},
+        SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        num_slots=n,
+        resumable=True,
+    )
+    for _ in range(64):
+        if not engine.has_unfinished_requests():
+            break
+        driver.step()
+    else:
+        pytest.fail("the paused fork kept the engine busy")
+    assert driver.finished
+    info = engine.inspect_kv("paused")
+    assert info.status == "WAITING_FOR_STREAMING_REQ"
+    assert info.num_slots == n + 2
+    engine.abort_request(["paused"])
+    with pytest.raises(KeyError, match="unknown request"):
+        engine.inspect_kv("paused")
+
+
+def test_preempting_an_edited_request_finishes_it_as_kv_edit_lost(prompt_ids):
+    """Preemption recomputes a request from its tokens, which for an edited
+    cache is a clean prefill that never saw the edit. Instead the engine
+    finishes the request with ``finish_reason="kv_edit_lost"`` and later
+    surgery calls on it raise ``KVEditLostError``; an unedited request
+    preempted the same way resumes and finishes as in stock vLLM.
+
+    A 64-block pool (63 usable, 1008 slots) is shared by a long request (600
+    prompt + 380 generated, 62 blocks alone) and a shorter one admitted
+    after it; both decode until the pool is dry, and the scheduler preempts
+    the most recently admitted running request. An edit re-admits its
+    request, so the edited one is the victim either way."""
+    engine = _make_engine(multiprocess=False, num_gpu_blocks_override=64)
+    try:
+        long_ids = (prompt_ids * 12)[:600]
+        short_ids = (prompt_ids * 6)[:300]
+
+        long = Driver(engine, "long", long_ids, 380)
+        long.run_until(1)
+        edited = Driver(engine, "edited", short_ids, 400)
+        edited.run_until(2)
+        n = engine.inspect_kv("edited").num_slots
+        edited.edit(ShiftOp(0, len(short_ids), 5, expected_num_slots=n))
+        for _ in range(200):
+            if edited.finished:
+                break
+            edited.step()
+        assert edited.finished
+        assert edited.finish_reason == "kv_edit_lost"
+        assert len(edited.generated) < 400
+        with pytest.raises(KVEditLostError, match="kv_edit_lost"):
+            engine.inspect_kv("edited")
+        with pytest.raises(KVEditLostError):
+            engine.edit_kv("edited", ShiftOp(0, 1, 1.0))
+        with pytest.raises(KVEditLostError):
+            engine.fork_request(
+                "edited",
+                "of-lost",
+                {"prompt_token_ids": prompt_ids[:1]},
+                SamplingParams(max_tokens=1),
+            )
+        # The other request was untouched.
+        assert engine.inspect_kv("long").status == "RUNNING"
+        for _ in range(600):
+            if long.finished:
+                break
+            long.step()
+        assert long.finish_reason == "length"
+        assert len(long.generated) == 380
+
+        # Stock behaviour for an unedited victim: preempted, then resumed and
+        # finished once the long request freed its blocks.
+        long = Driver(engine, "long-2", long_ids, 380)
+        long.run_until(1)
+        plain = Driver(engine, "plain", short_ids, 100)
+        preemptions = 0
+        for _ in range(900):
+            if plain.finished:
+                break
+            plain.step()
+            if (req := _scheduler(engine).requests.get(plain.core_req_id)) is not None:
+                preemptions = max(preemptions, req.num_preemptions)
+        assert preemptions >= 1
+        assert plain.finish_reason == "length"
+        assert len(plain.generated) == 100
+        assert len(long.finish()) == 380
     finally:
         engine.engine_core.shutdown()
 

@@ -33,7 +33,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
-from vllm.v1.kv_surgery.ops import KVEditOp, SpliceOp, as_edit_op
+from vllm.v1.kv_surgery.ops import KVEditLostError, KVEditOp, SpliceOp, as_edit_op
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -197,6 +197,13 @@ class RequestState:
         self.input_chunk_queue: deque[StreamingUpdate] | None = (
             deque() if stream_input else None
         )
+
+    @property
+    def is_paused(self) -> bool:
+        """A resumable request the engine has stopped and that waits for its
+        next input chunk (WAITING_FOR_STREAMING_REQ in the core): it holds
+        its KV cache but needs no engine step."""
+        return self.streaming_input and self.input_chunk_queue is None
 
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
@@ -446,6 +453,9 @@ class RequestState:
         return PoolingOutput(data=pooling_output)
 
 
+_MAX_REMEMBERED_KV_EDIT_LOST = 4096
+
+
 class OutputProcessor:
     """Process EngineCoreOutputs into RequestOutputs."""
 
@@ -465,6 +475,10 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
+        # Ids (external and internal) of requests finished with
+        # FinishReason.KV_EDIT_LOST, oldest first, so a later surgery call on
+        # one raises KVEditLostError rather than "unknown request".
+        self._kv_edit_lost: dict[str, None] = {}
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -494,6 +508,11 @@ class OutputProcessor:
             return request_id
         internal_ids = self.external_req_ids.get(request_id)
         if not internal_ids:
+            if request_id in self._kv_edit_lost:
+                raise KVEditLostError(
+                    f"request {request_id!r} was finished by preemption while "
+                    "its KV cache was edited (kv_edit_lost)"
+                )
             raise KeyError(f"unknown request {request_id!r}")
         if len(internal_ids) > 1:
             raise ValueError(
@@ -514,7 +533,10 @@ class OutputProcessor:
         )
 
     def has_unfinished_requests(self) -> bool:
-        return len(self.request_states) > 0
+        """Whether any request still needs engine steps. Paused resumable
+        requests do not count: they hold KV cache for a later input chunk
+        and would otherwise keep ``LLM.generate`` stepping forever."""
+        return any(not state.is_paused for state in self.request_states.values())
 
     def propagate_error(self, e: Exception):
         """Propagate error to all generate() tasks."""
@@ -613,6 +635,9 @@ class OutputProcessor:
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
+        # A reused id names this request from now on.
+        self._kv_edit_lost.pop(request_id, None)
+        self._kv_edit_lost.pop(req_state.external_req_id, None)
 
         # Track the external_req_id -> [internal_req_id, ...] mapping
         self.external_req_ids[req_state.external_req_id].append(request_id)
@@ -698,6 +723,11 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
+            # A resumable request's finish is normally a pause; a lost edited
+            # cache is final (the core has freed the request).
+            kv_edit_lost = finish_reason == FinishReason.KV_EDIT_LOST
+            if kv_edit_lost:
+                self._remember_kv_edit_lost(req_state)
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
@@ -744,7 +774,7 @@ class OutputProcessor:
                 kv_transfer_params,
                 ec_transfer_params,
             ):
-                if req_state.streaming_input:
+                if req_state.streaming_input and not kv_edit_lost:
                     request_output.finished = False
 
                 if req_state.queue is not None:
@@ -756,7 +786,7 @@ class OutputProcessor:
 
             # Free completed requests.
             if finish_reason is not None:
-                if req_state.streaming_input:
+                if req_state.streaming_input and not kv_edit_lost:
                     if req_state.input_chunk_queue:
                         update = req_state.input_chunk_queue.popleft()
                         req_state.apply_streaming_update(update)
@@ -780,6 +810,13 @@ class OutputProcessor:
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
         )
+
+    def _remember_kv_edit_lost(self, req_state: RequestState) -> None:
+        for req_id in (req_state.request_id, req_state.external_req_id):
+            self._kv_edit_lost.pop(req_id, None)
+            self._kv_edit_lost[req_id] = None
+        while len(self._kv_edit_lost) > _MAX_REMEMBERED_KV_EDIT_LOST:
+            del self._kv_edit_lost[next(iter(self._kv_edit_lost))]
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id

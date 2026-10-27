@@ -90,5 +90,26 @@ def test_find_rotary_emb_prefers_the_sibling_named_rotary_emb():
     model.layers[0].mlp.attn = nn.Module()
 
     assert _find_rotary_emb(model, "layers.0.self_attn.mla_attn.mla_attn") is rope
-    with pytest.raises(NotImplementedError, match="no RotaryEmbedding"):
+    with pytest.raises(NotImplementedError, match="no rotary embedding"):
         _find_rotary_emb(model, "layers.0.mlp.attn")
+
+
+def test_find_rotary_emb_accepts_deepseek_yarn():
+    """DeepSeek's YaRN module derives from ``RotaryEmbeddingBase``, not
+    ``RotaryEmbedding``; the lookup must still find it (Kimi K2 and DeepSeek
+    V3 ``rope_scaling`` checkpoints failed every fork without this)."""
+    rope = DeepseekScalingRotaryEmbedding(
+        HEAD, HEAD, MAX_POS, 10000.0, False, 40.0, torch.float32, mscale=1.0
+    )
+    assert not isinstance(rope, RotaryEmbedding)
+    self_attn = nn.Module()
+    self_attn.rotary_emb = rope
+    self_attn.mla_attn = nn.Module()
+    self_attn.mla_attn.mla_attn = nn.Module()
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    model.layers[0].self_attn = self_attn
+
+    found = _find_rotary_emb(model, "layers.0.self_attn.mla_attn.mla_attn")
+    assert found is rope
+    torch.testing.assert_close(inv_freq_of(found), rope._compute_inv_freq(40.0))

@@ -16,7 +16,10 @@ from torch import nn
 
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
-from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.base import (
+    RotaryEmbedding,
+    RotaryEmbeddingBase,
+)
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
 )
@@ -97,8 +100,8 @@ class RopeDescriptor:
         return self.kv_cache.shape[2]
 
 
-def inv_freq_of(rope: RotaryEmbedding) -> torch.Tensor:
-    """The per-pair angular frequencies a ``RotaryEmbedding`` rotates with.
+def inv_freq_of(rope: RotaryEmbeddingBase) -> torch.Tensor:
+    """The per-pair angular frequencies a rotary embedding rotates with.
 
     Built from the module's own ``_compute_inv_freq``, never from its
     ``cos_sin_cache``: YaRN folds ``mscale`` into the cache and a delta
@@ -132,12 +135,15 @@ def inv_freq_of(rope: RotaryEmbedding) -> torch.Tensor:
     return inv_freq
 
 
-def _find_rotary_emb(model: nn.Module, layer_name: str) -> RotaryEmbedding:
-    """The ``RotaryEmbedding`` that rotated this attention layer's keys.
+def _find_rotary_emb(model: nn.Module, layer_name: str) -> RotaryEmbeddingBase:
+    """The rotary embedding that rotated this attention layer's keys.
 
     Walks up the module tree from the attention layer and takes the nearest
     ancestor's ``rotary_emb`` child (DeepSeek-style indexers keep theirs under
-    a different name, so the name matters).
+    a different name, so the name matters). Any ``RotaryEmbeddingBase`` child
+    counts: DeepSeek's YaRN module (Kimi K2, DeepSeek V2/V3 with
+    ``rope_scaling``) is not a ``RotaryEmbedding`` subclass. Whether the
+    variant found is one surgery can rotate is ``inv_freq_of``'s decision.
     """
     parts = layer_name.split(".")
     for depth in range(len(parts) - 1, -1, -1):
@@ -146,7 +152,7 @@ def _find_rotary_emb(model: nn.Module, layer_name: str) -> RotaryEmbedding:
         ropes = {
             child_name: child
             for child_name, child in parent.named_children()
-            if isinstance(child, RotaryEmbedding)
+            if isinstance(child, RotaryEmbeddingBase)
         }
         if "rotary_emb" in ropes:
             return ropes["rotary_emb"]
@@ -157,7 +163,7 @@ def _find_rotary_emb(model: nn.Module, layer_name: str) -> RotaryEmbedding:
                 f"{layer_name}: ambiguous rotary embeddings on {name}: {sorted(ropes)}"
             )
     raise NotImplementedError(
-        f"{layer_name}: no RotaryEmbedding found above this layer; KV surgery "
+        f"{layer_name}: no rotary embedding found above this layer; KV surgery "
         "only supports RoPE models"
     )
 

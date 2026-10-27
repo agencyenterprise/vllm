@@ -309,8 +309,8 @@ def _check_writable(
 
 def _positions_of(request: Request) -> np.ndarray:
     # A stock layout is the pair (kv_positions None, offset 0); commit_edit
-    # and reset_kv_surgery_layout always set both, and continue_positions
-    # ignores the offset for the None case.
+    # and commit_fork always set both, and continue_positions ignores the
+    # offset for the None case.
     assert request.kv_positions is not None or request.position_offset == 0, (
         f"{request.request_id}: position offset without per-slot positions"
     )
@@ -629,9 +629,10 @@ def plan_fork(
     assert params is not None  # pooling was rejected above
     if params.n != 1:
         raise ValueError("a fork samples one sequence; n must be 1")
-    if params.prompt_logprobs is not None:
-        # The frontend knows the fork's prompt as the appended tokens only.
-        raise NotImplementedError("prompt_logprobs are not supported on a fork")
+    # prompt_logprobs need no special case: the worker computes them for the
+    # prompt tokens past num_computed_tokens, i.e. the appended ones, and the
+    # frontend, which knows the prompt as the appended tokens, prepends the
+    # usual None for the first.
     # Slots and positions are bounded separately: a source shifted down can
     # have more slots than positions, and vice versa.
     if num_slots + num_new > scheduler.max_model_len:

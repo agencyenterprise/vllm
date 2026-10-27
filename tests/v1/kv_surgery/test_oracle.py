@@ -115,6 +115,20 @@ MODELS = {
         perturbation_atol=1.0,
         min_contrast=4.0,
     ),
+    # deepseek_v2 MLA + MoE with DeepSeek's YaRN rope scaling (factor 40,
+    # mscale 0.707): the rotary module is ``DeepseekScalingRotaryEmbedding``,
+    # which is not a ``RotaryEmbedding`` subclass (Kimi K2 and DeepSeek V3
+    # checkpoints with ``rope_scaling`` take the same path). Moonlight has no
+    # scaling, so it does not cover this.
+    "deepseek_v2_lite": OracleModel(
+        engine_args=dict(
+            model="deepseek-ai/DeepSeek-V2-Lite",
+            gpu_memory_utilization=0.5,
+            trust_remote_code=True,
+        ),
+        perturbation_atol=1.0,
+        min_contrast=4.0,
+    ),
     # Hybrid GQA + MoE: five sliding-window (1024) layers per global layer,
     # different RoPE bases and head dims per layer type, partial rotary on
     # the global layers. The hybrid KV cache manager is disabled so window

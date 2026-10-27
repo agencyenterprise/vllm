@@ -33,7 +33,13 @@ from vllm.v1.kv_surgery.view import (
     splice,
 )
 
+__version__ = "0.1.0"
+"""Version of the surgery API and, with it, of the edit arithmetic: a change
+to what an edit computes (rotation order or dtype, rounding, which rows are
+rewritten) is a major bump, since recorded edits would replay differently."""
+
 __all__ = [
+    "__version__",
     "EditPlan",
     "RopeDescriptor",
     "View",

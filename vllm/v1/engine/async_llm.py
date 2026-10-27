@@ -52,12 +52,7 @@ from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollec
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
-from vllm.v1.kv_surgery.ops import (
-    KVEditOp,
-    KVEditResult,
-    KVViewInfo,
-    stale_span_errors_restored,
-)
+from vllm.v1.kv_surgery.ops import KVEditOp, KVEditResult, KVViewInfo
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -1058,12 +1053,14 @@ class AsyncLLM(EngineClient):
         counting against ``max_tokens``, and the streamed history never
         reflects spliced-in tokens; see ``LLMEngine.edit_kv``. Compute spans
         from ``inspect_kv``: the engine core runs ahead of streamed output.
+        Preemption of an edited request finishes it with
+        ``finish_reason="kv_edit_lost"``; see ``LLMEngine.edit_kv`` for that
+        and for the exceptions raised.
         """
         request_id = self.output_processor.resolve_request_id(request_id)
-        with stale_span_errors_restored():
-            return await self.engine_core.edit_kv_async(
-                request_id, self.output_processor.resolve_edit_op(op)
-            )
+        return await self.engine_core.edit_kv_async(
+            request_id, self.output_processor.resolve_edit_op(op)
+        )
 
     async def add_fork_request(
         self,
@@ -1151,11 +1148,11 @@ class AsyncLLM(EngineClient):
         NOT aborted when this generator ends or is closed: it keeps its KV
         cache and the source's shared blocks pinned until the caller
         ``abort``s it. Closing the generator before the pause arrives still
-        aborts the fork. If the fork is preempted it recomputes its prefix
-        from its own tokens, which is not the source's cache when the source
-        had been edited (a warning is logged).
-        Outputs report ``prompt_token_ids`` as the appended tokens only
-        (``prompt_logprobs`` are rejected). See ``LLMEngine.fork_request``.
+        aborts the fork. A fork of an edited source that gets preempted is
+        finished with ``finish_reason="kv_edit_lost"`` (its stream ends with
+        that final output).
+        Outputs report ``prompt_token_ids`` and ``prompt_logprobs`` over the
+        appended tokens only. See ``LLMEngine.fork_request``.
 
         A fork the engine core rejects (unknown source, bad ``num_slots``,
         ``n > 1``, ...) raises that rejection directly before any output;

@@ -190,8 +190,8 @@ class Request:
         # position per computed KV slot as of the last edit; None means the
         # stock contiguous layout. New tokens get position
         # `slot_index + position_offset`, so the hot path only ever sees the
-        # offset. Both reset when the request is preempted (its cache is
-        # recomputed from scratch, consistently).
+        # offset. An edited layout cannot be recomputed from the token ids,
+        # so preempting such a request finishes it (FINISHED_KV_EDIT_LOST).
         self.kv_positions: np.ndarray | None = None
         self.position_offset = 0
 
@@ -293,17 +293,12 @@ class Request:
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
 
-    def reset_kv_surgery_layout(self) -> None:
-        """Forget an edited KV layout because the cache will be recomputed."""
-        if self.kv_positions is None and self.position_offset == 0:
-            return
-        logger.warning(
-            "%s: request with an edited KV cache is recomputed from scratch; "
-            "its edited positions are lost",
-            self.request_id,
-        )
-        self.kv_positions = None
-        self.position_offset = 0
+    @property
+    def has_edited_kv_layout(self) -> bool:
+        """The KV cache differs from a fresh prefill of the token history:
+        some edit rotated, dropped or spliced slots, or the request is a fork
+        of one that had been. A fork of a stock request is stock itself."""
+        return self.kv_positions is not None or self.position_offset != 0
 
     @property
     def use_structured_output(self) -> bool:
@@ -403,6 +398,7 @@ class RequestStatus(enum.IntEnum):
     FINISHED_IGNORED = enum.auto()
     FINISHED_ERROR = enum.auto()
     FINISHED_REPETITION = enum.auto()
+    FINISHED_KV_EDIT_LOST = enum.auto()
 
     def __str__(self) -> str:
         return self.name
@@ -428,4 +424,5 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_ERROR: FinishReason.ERROR,
     RequestStatus.WAITING_FOR_STREAMING_REQ: FinishReason.STOP,
     RequestStatus.FINISHED_REPETITION: FinishReason.REPETITION,
+    RequestStatus.FINISHED_KV_EDIT_LOST: FinishReason.KV_EDIT_LOST,
 }
